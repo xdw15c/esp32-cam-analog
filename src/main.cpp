@@ -43,6 +43,10 @@ struct GaugeConfig {
   float valueMin = 0.0f;
   float valueMax = 0.0f;
   String unit;
+  String analysisMode = "color_target";
+  String needleColor = "#D00000";
+  String backgroundColor = "#7F7F7F";
+  String textColor = "#101010";
   bool valid = false;
 };
 
@@ -123,6 +127,10 @@ input:focus{outline:2px solid #3b82f6;border-color:transparent}
 pre{background:#0f172a;color:#e2e8f0;padding:.75rem;border-radius:8px;overflow:auto;font-size:.78rem}
 .imginfo{color:#64748b;font-size:.8rem;margin:.3rem 0 0}
 .analysis{margin-top:1rem}
+.cfg-ana{margin:.6rem 0 0;padding:.55rem;border:1px dashed #cbd5e1;border-radius:8px;background:#f8fafc}
+.cfg-ana-grid{display:grid;grid-template-columns:repeat(2,minmax(140px,1fr));gap:.5rem}
+@media(max-width:640px){.cfg-ana-grid{grid-template-columns:1fr}}
+select,input[type=color]{width:100%;border:1px solid #cbd5e1;border-radius:6px;padding:.3rem .45rem;font-size:.875rem;background:#fff;min-height:34px}
 </style>
 </head><body>
 
@@ -175,6 +183,27 @@ pre{background:#0f172a;color:#e2e8f0;padding:.75rem;border-radius:8px;overflow:a
       <label>Wartosc MIN</label><input type="number" id="g1-vmin" value="0">
       <label>Wartosc MAX</label><input type="number" id="g1-vmax" value="10">
       <label>Jednostka</label><input type="text" id="g1-unit" value="bar">
+      <div class="cfg-ana">
+        <label>Tryb analizy M1</label>
+        <select id="g1-analysis-mode" onchange="onGaugeAnalysisModeChanged(1);updatePreview();">
+          <option value="classic_darkness">Klasyczna (najciemniejsza wskazowka)</option>
+          <option value="color_target">Kolorowa (wskazany kolor wskazowki)</option>
+        </select>
+        <div id="g1-color-settings" class="cfg-ana-grid">
+          <div>
+            <label>Kolor wskazowki</label>
+            <input type="color" id="g1-needle-color" value="#d00000" oninput="updatePreview()">
+          </div>
+          <div>
+            <label>Kolor tla tarczy</label>
+            <input type="color" id="g1-background-color" value="#7f7f7f" oninput="updatePreview()">
+          </div>
+          <div>
+            <label>Kolor cyfr/napisow</label>
+            <input type="color" id="g1-text-color" value="#101010" oninput="updatePreview()">
+          </div>
+        </div>
+      </div>
     </div>
     <div class="gc g2">
       <h3 style="color:#2563eb">&#9899; Manometr 2</h3>
@@ -188,6 +217,27 @@ pre{background:#0f172a;color:#e2e8f0;padding:.75rem;border-radius:8px;overflow:a
       <label>Wartosc MIN</label><input type="number" id="g2-vmin" value="0">
       <label>Wartosc MAX</label><input type="number" id="g2-vmax" value="10">
       <label>Jednostka</label><input type="text" id="g2-unit" value="bar">
+      <div class="cfg-ana">
+        <label>Tryb analizy M2</label>
+        <select id="g2-analysis-mode" onchange="onGaugeAnalysisModeChanged(2);updatePreview();">
+          <option value="classic_darkness">Klasyczna (najciemniejsza wskazowka)</option>
+          <option value="color_target">Kolorowa (wskazany kolor wskazowki)</option>
+        </select>
+        <div id="g2-color-settings" class="cfg-ana-grid">
+          <div>
+            <label>Kolor wskazowki</label>
+            <input type="color" id="g2-needle-color" value="#d00000" oninput="updatePreview()">
+          </div>
+          <div>
+            <label>Kolor tla tarczy</label>
+            <input type="color" id="g2-background-color" value="#7f7f7f" oninput="updatePreview()">
+          </div>
+          <div>
+            <label>Kolor cyfr/napisow</label>
+            <input type="color" id="g2-text-color" value="#101010" oninput="updatePreview()">
+          </div>
+        </div>
+      </div>
     </div>
   </div>
   <div class="card" style="margin-top:1rem">
@@ -325,7 +375,11 @@ function buildConfig(){
         cx:gv(p+'-cx'),cy:gv(p+'-cy'),radius:gv(p+'-r'),
         angle_min:gv(p+'-amin'),angle_max:gv(p+'-amax'),
         value_min:gv(p+'-vmin'),value_max:gv(p+'-vmax'),
-        unit:document.getElementById(p+'-unit').value};
+        unit:document.getElementById(p+'-unit').value,
+        analysis_mode:document.getElementById(p+'-analysis-mode').value,
+        needle_color:document.getElementById(p+'-needle-color').value,
+        background_color:document.getElementById(p+'-background-color').value,
+        text_color:document.getElementById(p+'-text-color').value};
     })
   };
 }
@@ -338,8 +392,19 @@ function applyConfig(cfg){
     s(p+'-name',g.name);s(p+'-cx',g.cx);s(p+'-cy',g.cy);s(p+'-r',g.radius);
     s(p+'-amin',g.angle_min);s(p+'-amax',g.angle_max);
     s(p+'-vmin',g.value_min);s(p+'-vmax',g.value_max);s(p+'-unit',g.unit);
+    s(p+'-analysis-mode',g.analysis_mode||cfg.analysis_mode||'color_target');
+    s(p+'-needle-color',g.needle_color||cfg.needle_color||'#d00000');
+    s(p+'-background-color',g.background_color||cfg.background_color||'#7f7f7f');
+    s(p+'-text-color',g.text_color||cfg.text_color||'#101010');
+    onGaugeAnalysisModeChanged(n);
   });
   redraw();
+}
+
+function onGaugeAnalysisModeChanged(n){
+  const mode=document.getElementById('g'+n+'-analysis-mode').value;
+  const box=document.getElementById('g'+n+'-color-settings');
+  box.style.display=(mode==='color_target')?'block':'none';
 }
 
 function updatePreview(){
@@ -387,6 +452,8 @@ async function loadModbusStatus(){
 
 loadCamImg();
 loadConfig();
+onGaugeAnalysisModeChanged(1);
+onGaugeAnalysisModeChanged(2);
 </script>
 </body></html>
 )HTML";
@@ -539,9 +606,43 @@ bool parseGaugeConfig(const String &objectText, GaugeConfig &gauge) {
   jsonExtractNumber(objectText, "value_min", gauge.valueMin);
   jsonExtractNumber(objectText, "value_max", gauge.valueMax);
   jsonExtractString(objectText, "unit", gauge.unit);
+  jsonExtractString(objectText, "analysis_mode", gauge.analysisMode);
+  jsonExtractString(objectText, "needle_color", gauge.needleColor);
+  jsonExtractString(objectText, "background_color", gauge.backgroundColor);
+  jsonExtractString(objectText, "text_color", gauge.textColor);
 
   gauge.valid = gauge.id >= 1 && gauge.id <= kGaugeCount && gauge.radius > 0;
   return gauge.valid;
+}
+
+bool parseHexColor(const String &value, uint8_t &r, uint8_t &g, uint8_t &b) {
+  if (value.length() != 7 || value[0] != '#') return false;
+
+  auto hexToNibble = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+  };
+
+  const int r1 = hexToNibble(value[1]);
+  const int r2 = hexToNibble(value[2]);
+  const int g1 = hexToNibble(value[3]);
+  const int g2 = hexToNibble(value[4]);
+  const int b1 = hexToNibble(value[5]);
+  const int b2 = hexToNibble(value[6]);
+  if (r1 < 0 || r2 < 0 || g1 < 0 || g2 < 0 || b1 < 0 || b2 < 0) return false;
+
+  r = static_cast<uint8_t>((r1 << 4) | r2);
+  g = static_cast<uint8_t>((g1 << 4) | g2);
+  b = static_cast<uint8_t>((b1 << 4) | b2);
+  return true;
+}
+
+String formatHexColor(uint8_t r, uint8_t g, uint8_t b) {
+  char out[8];
+  snprintf(out, sizeof(out), "#%02X%02X%02X", r, g, b);
+  return String(out);
 }
 
 bool loadDeviceConfig(DeviceConfig &config) {
@@ -553,6 +654,15 @@ bool loadDeviceConfig(DeviceConfig &config) {
 
   jsonExtractString(json, "device_id", config.deviceId);
   jsonExtractInt(json, "interval_s", config.intervalS);
+
+  String legacyMode = "color_target";
+  String legacyNeedle = "#D00000";
+  String legacyBackground = "#7F7F7F";
+  String legacyText = "#101010";
+  jsonExtractString(json, "analysis_mode", legacyMode);
+  jsonExtractString(json, "needle_color", legacyNeedle);
+  jsonExtractString(json, "background_color", legacyBackground);
+  jsonExtractString(json, "text_color", legacyText);
 
   const int gaugesPos = json.indexOf("\"gauges\"");
   if (gaugesPos < 0) return false;
@@ -582,6 +692,24 @@ bool loadDeviceConfig(DeviceConfig &config) {
     if (objectEnd < 0) break;
     GaugeConfig gauge;
     if (parseGaugeConfig(json.substring(objectStart, objectEnd + 1), gauge)) {
+      if (gauge.analysisMode != "classic_darkness" && gauge.analysisMode != "color_target") {
+        gauge.analysisMode = legacyMode;
+      }
+      if (gauge.analysisMode != "classic_darkness" && gauge.analysisMode != "color_target") {
+        gauge.analysisMode = "color_target";
+      }
+
+      uint8_t cr = 0;
+      uint8_t cg = 0;
+      uint8_t cb = 0;
+      if (!parseHexColor(gauge.needleColor, cr, cg, cb)) gauge.needleColor = legacyNeedle;
+      if (!parseHexColor(gauge.backgroundColor, cr, cg, cb)) gauge.backgroundColor = legacyBackground;
+      if (!parseHexColor(gauge.textColor, cr, cg, cb)) gauge.textColor = legacyText;
+
+      if (!parseHexColor(gauge.needleColor, cr, cg, cb)) gauge.needleColor = "#D00000";
+      if (!parseHexColor(gauge.backgroundColor, cr, cg, cb)) gauge.backgroundColor = "#7F7F7F";
+      if (!parseHexColor(gauge.textColor, cr, cg, cb)) gauge.textColor = "#101010";
+
       config.gauges[gauge.id - 1] = gauge;
     }
     cursor = objectEnd + 1;
@@ -620,12 +748,29 @@ uint8_t rgb565ToGray(uint16_t pixel) {
   return static_cast<uint8_t>((r * 30 + g * 59 + b * 11) / 100);
 }
 
+void rgb565ToRgb(uint16_t pixel, uint8_t &r, uint8_t &g, uint8_t &b) {
+  r = ((pixel >> 11) & 0x1F) * 255 / 31;
+  g = ((pixel >> 5) & 0x3F) * 255 / 63;
+  b = (pixel & 0x1F) * 255 / 31;
+}
+
 bool sampleGray(const camera_fb_t *fb, int x, int y, uint8_t &gray) {
   if (!fb || fb->format != PIXFORMAT_RGB565) return false;
   if (x < 0 || y < 0 || x >= fb->width || y >= fb->height) return false;
 
   const uint16_t *pixels = reinterpret_cast<const uint16_t *>(fb->buf);
   gray = rgb565ToGray(pixels[(y * fb->width) + x]);
+  return true;
+}
+
+bool sampleRgb(const camera_fb_t *fb, int x, int y, uint8_t &r, uint8_t &g, uint8_t &b, uint8_t &gray) {
+  if (!fb || fb->format != PIXFORMAT_RGB565) return false;
+  if (x < 0 || y < 0 || x >= fb->width || y >= fb->height) return false;
+
+  const uint16_t *pixels = reinterpret_cast<const uint16_t *>(fb->buf);
+  const uint16_t pixel = pixels[(y * fb->width) + x];
+  rgb565ToRgb(pixel, r, g, b);
+  gray = static_cast<uint8_t>((r * 30 + g * 59 + b * 11) / 100);
   return true;
 }
 
@@ -692,7 +837,39 @@ float angleToValue(float angleDeg, const GaugeConfig &gauge) {
   return gauge.valueMin + ratio * (gauge.valueMax - gauge.valueMin);
 }
 
-float scoreNeedleAngle(const camera_fb_t *fb, const GaugeConfig &gauge, float angleDeg) {
+struct AngleScore {
+  float redStrength = 0.0f;
+  float grayLevel = 255.0f;
+};
+
+struct AnalysisColorProfile {
+  uint8_t needleR = 208;
+  uint8_t needleG = 0;
+  uint8_t needleB = 0;
+  uint8_t backgroundR = 127;
+  uint8_t backgroundG = 127;
+  uint8_t backgroundB = 127;
+  uint8_t textR = 16;
+  uint8_t textG = 16;
+  uint8_t textB = 16;
+};
+
+AnalysisColorProfile buildColorProfile(const GaugeConfig &gauge) {
+  AnalysisColorProfile profile;
+  parseHexColor(gauge.needleColor, profile.needleR, profile.needleG, profile.needleB);
+  parseHexColor(gauge.backgroundColor, profile.backgroundR, profile.backgroundG, profile.backgroundB);
+  parseHexColor(gauge.textColor, profile.textR, profile.textG, profile.textB);
+  return profile;
+}
+
+float colorDistanceSq(uint8_t r1, uint8_t g1, uint8_t b1, uint8_t r2, uint8_t g2, uint8_t b2) {
+  const float dr = static_cast<float>(r1) - r2;
+  const float dg = static_cast<float>(g1) - g2;
+  const float db = static_cast<float>(b1) - b2;
+  return dr * dr + dg * dg + db * db;
+}
+
+float scoreClassicDarkness(const camera_fb_t *fb, const GaugeConfig &gauge, float angleDeg, float &grayLevel) {
   const float angleRad = angleToRadians(angleDeg);
   const float dirX = cosf(angleRad);
   const float dirY = sinf(angleRad);
@@ -704,7 +881,6 @@ float scoreNeedleAngle(const camera_fb_t *fb, const GaugeConfig &gauge, float an
 
   uint32_t sum = 0;
   uint16_t samples = 0;
-  uint16_t iter = 0;
   for (float radius = startRadius; radius <= endRadius; radius += step) {
     for (int offset = -2; offset <= 2; ++offset) {
       const int x = lroundf(gauge.cx + dirX * radius + perpX * offset);
@@ -713,6 +889,59 @@ float scoreNeedleAngle(const camera_fb_t *fb, const GaugeConfig &gauge, float an
       if (!sampleGray(fb, x, y, gray)) continue;
       sum += gray;
       ++samples;
+    }
+    delay(0);
+  }
+
+  grayLevel = samples > 0 ? (static_cast<float>(sum) / samples) : 255.0f;
+  // Higher is better for unified selection logic.
+  return 255.0f - grayLevel;
+}
+
+AngleScore scoreNeedleAngleColor(const camera_fb_t *fb, const GaugeConfig &gauge, const AnalysisColorProfile &profile, float angleDeg) {
+  const float angleRad = angleToRadians(angleDeg);
+  const float dirX = cosf(angleRad);
+  const float dirY = sinf(angleRad);
+  const float perpX = -dirY;
+  const float perpY = dirX;
+  const float startRadius = gauge.radius * 0.28f;
+  const float endRadius = gauge.radius * 0.92f;
+  const float step = max(1.0f, gauge.radius / 28.0f);
+
+  AngleScore score;
+  uint32_t graySum = 0;
+  float redSum = 0.0f;
+  uint16_t redHits = 0;
+  uint16_t samples = 0;
+  uint16_t iter = 0;
+  for (float radius = startRadius; radius <= endRadius; radius += step) {
+    for (int offset = -1; offset <= 1; ++offset) {
+      const int x = lroundf(gauge.cx + dirX * radius + perpX * offset);
+      const int y = lroundf(gauge.cy + dirY * radius + perpY * offset);
+      uint8_t r = 0;
+      uint8_t g = 0;
+      uint8_t b = 0;
+      uint8_t gray = 0;
+      if (!sampleRgb(fb, x, y, r, g, b, gray)) continue;
+
+      const float dNeedle = colorDistanceSq(r, g, b, profile.needleR, profile.needleG, profile.needleB);
+      const float dBg = colorDistanceSq(r, g, b, profile.backgroundR, profile.backgroundG, profile.backgroundB);
+      const float dText = colorDistanceSq(r, g, b, profile.textR, profile.textG, profile.textB);
+
+      // Reward pixels near target needle color and far from background/text colors.
+      const float proximityNeedle = max(0.0f, 255.0f - sqrtf(dNeedle));
+      const float awayFromBg = min(255.0f, sqrtf(dBg));
+      const float awayFromText = min(255.0f, sqrtf(dText));
+      const float weighted = (proximityNeedle * 1.6f) + (awayFromBg * 0.5f) + (awayFromText * 0.5f);
+
+      const bool looksNeedle = (proximityNeedle >= 28.0f) && (dNeedle < dBg) && (dNeedle < dText);
+      if (looksNeedle) {
+        redSum += weighted;
+        ++redHits;
+      }
+
+      graySum += gray;
+      ++samples;
       ++iter;
       if ((iter % 200) == 0) {
         delay(0);
@@ -720,17 +949,27 @@ float scoreNeedleAngle(const camera_fb_t *fb, const GaugeConfig &gauge, float an
     }
   }
 
-  if (samples == 0) return 255.0f;
-  return static_cast<float>(sum) / samples;
+  if (samples == 0) return score;
+
+  score.grayLevel = static_cast<float>(graySum) / samples;
+  if (redHits == 0) {
+    score.redStrength = 0.0f;
+    return score;
+  }
+
+  const float hitRatio = static_cast<float>(redHits) / samples;
+  score.redStrength = (redSum / redHits) + (hitRatio * 90.0f);
+  return score;
 }
 
-GaugeReading analyzeGauge(const camera_fb_t *fb, const GaugeConfig &gauge) {
+GaugeReading analyzeGaugeClassic(const camera_fb_t *fb, const GaugeConfig &gauge) {
   GaugeReading reading;
   if (!gauge.valid || !fb || fb->format != PIXFORMAT_RGB565) return reading;
 
   constexpr float kAngleStep = 2.0f;
   constexpr int kMaxSamples = 181;
   float scores[kMaxSamples];
+  float grayLevels[kMaxSamples];
   float angles[kMaxSamples];
   int count = 0;
 
@@ -738,7 +977,9 @@ GaugeReading analyzeGauge(const camera_fb_t *fb, const GaugeConfig &gauge) {
   const float end = max(gauge.angleMin, gauge.angleMax);
   for (float angle = start; angle <= end && count < kMaxSamples; angle += kAngleStep) {
     angles[count] = angle;
-    scores[count] = scoreNeedleAngle(fb, gauge, angle);
+    float gray = 255.0f;
+    scores[count] = scoreClassicDarkness(fb, gauge, angle, gray);
+    grayLevels[count] = gray;
     ++count;
     if ((count % 12) == 0) {
       delay(0);
@@ -749,21 +990,21 @@ GaugeReading analyzeGauge(const camera_fb_t *fb, const GaugeConfig &gauge) {
 
   int bestIndex = 0;
   for (int i = 1; i < count; ++i) {
-    if (scores[i] < scores[bestIndex]) bestIndex = i;
+    if (scores[i] > scores[bestIndex]) bestIndex = i;
   }
 
   int secondIndex = -1;
   for (int i = 0; i < count; ++i) {
     if (abs(i - bestIndex) <= 2) continue;
-    if (secondIndex < 0 || scores[i] < scores[secondIndex]) secondIndex = i;
+    if (secondIndex < 0 || scores[i] > scores[secondIndex]) secondIndex = i;
   }
 
   const float bestScore = scores[bestIndex];
-  const float secondScore = secondIndex >= 0 ? scores[secondIndex] : 255.0f;
-  const float contrast = max(0.0f, secondScore - bestScore);
+  const float secondScore = secondIndex >= 0 ? scores[secondIndex] : 0.0f;
+  const float contrast = max(0.0f, bestScore - secondScore);
   const float confidence = clamp01(contrast / 45.0f);
 
-  if (bestScore > 220.0f || confidence < 0.08f) {
+  if (grayLevels[bestIndex] > 220.0f || confidence < 0.08f) {
     return reading;
   }
 
@@ -771,8 +1012,70 @@ GaugeReading analyzeGauge(const camera_fb_t *fb, const GaugeConfig &gauge) {
   reading.angleDeg = angles[bestIndex];
   reading.value = angleToValue(reading.angleDeg, gauge);
   reading.confidence = confidence;
-  reading.darkness = bestScore;
+  reading.darkness = grayLevels[bestIndex];
   return reading;
+}
+
+GaugeReading analyzeGaugeColor(const camera_fb_t *fb, const GaugeConfig &gauge, const AnalysisColorProfile &profile) {
+  GaugeReading reading;
+  if (!gauge.valid || !fb || fb->format != PIXFORMAT_RGB565) return reading;
+
+  constexpr float kAngleStep = 2.0f;
+  constexpr int kMaxSamples = 181;
+  float scores[kMaxSamples];
+  float grayLevels[kMaxSamples];
+  float angles[kMaxSamples];
+  int count = 0;
+
+  const float start = min(gauge.angleMin, gauge.angleMax);
+  const float end = max(gauge.angleMin, gauge.angleMax);
+  for (float angle = start; angle <= end && count < kMaxSamples; angle += kAngleStep) {
+    angles[count] = angle;
+    const AngleScore score = scoreNeedleAngleColor(fb, gauge, profile, angle);
+    scores[count] = score.redStrength;
+    grayLevels[count] = score.grayLevel;
+    ++count;
+    if ((count % 12) == 0) {
+      delay(0);
+    }
+  }
+
+  if (count == 0) return reading;
+
+  int bestIndex = 0;
+  for (int i = 1; i < count; ++i) {
+    if (scores[i] > scores[bestIndex]) bestIndex = i;
+  }
+
+  int secondIndex = -1;
+  for (int i = 0; i < count; ++i) {
+    if (abs(i - bestIndex) <= 2) continue;
+    if (secondIndex < 0 || scores[i] > scores[secondIndex]) secondIndex = i;
+  }
+
+  const float bestScore = scores[bestIndex];
+  const float secondScore = secondIndex >= 0 ? scores[secondIndex] : 0.0f;
+  const float contrast = max(0.0f, bestScore - secondScore);
+  const float confidence = clamp01(contrast / 40.0f);
+
+  if (bestScore < 14.0f || confidence < 0.05f) {
+    return reading;
+  }
+
+  reading.detected = true;
+  reading.angleDeg = angles[bestIndex];
+  reading.value = angleToValue(reading.angleDeg, gauge);
+  reading.confidence = confidence;
+  reading.darkness = grayLevels[bestIndex];
+  return reading;
+}
+
+GaugeReading analyzeGauge(const camera_fb_t *fb, const GaugeConfig &gauge) {
+  if (gauge.analysisMode == "classic_darkness") {
+    return analyzeGaugeClassic(fb, gauge);
+  }
+  const AnalysisColorProfile profile = buildColorProfile(gauge);
+  return analyzeGaugeColor(fb, gauge, profile);
 }
 
 String buildAnalysisJson(const DeviceConfig &config, const GaugeReading readings[], int frameWidth, int frameHeight, uint32_t elapsedMs) {
@@ -796,6 +1099,7 @@ String buildAnalysisJson(const DeviceConfig &config, const GaugeReading readings
     json += "\"id\":" + String(config.gauges[i].id) + ',';
     json += "\"name\":\"" + jsonEscape(config.gauges[i].name) + "\",";
     json += "\"unit\":\"" + jsonEscape(config.gauges[i].unit) + "\",";
+    json += "\"analysis_mode\":\"" + jsonEscape(config.gauges[i].analysisMode) + "\",";
     json += "\"detected\":";
     json += readings[i].detected ? "true" : "false";
     if (readings[i].detected) {
@@ -889,10 +1193,10 @@ void handleAnalyze() {
     const GaugeReading &r = readings[i];
     const GaugeConfig  &g = config.gauges[i];
     if (r.detected) {
-      Serial.printf("[CV] M%d %-16s  angle=%7.2f deg  value=%6.3f %s  conf=%.3f  dark=%.1f\n",
-        g.id, g.name.c_str(), r.angleDeg, r.value, g.unit.c_str(), r.confidence, r.darkness);
+      Serial.printf("[CV] M%d %-16s  mode=%s  angle=%7.2f deg  value=%6.3f %s  conf=%.3f  dark=%.1f\n",
+        g.id, g.name.c_str(), g.analysisMode.c_str(), r.angleDeg, r.value, g.unit.c_str(), r.confidence, r.darkness);
     } else {
-      Serial.printf("[CV] M%d %-16s  NOT DETECTED\n", g.id, g.name.c_str());
+      Serial.printf("[CV] M%d %-16s  mode=%s  NOT DETECTED\n", g.id, g.name.c_str(), g.analysisMode.c_str());
     }
   }
   server.send(200, "application/json", response);
@@ -1267,10 +1571,10 @@ static void runPeriodicAnalysis() {
     const GaugeReading &r = readings[i];
     const GaugeConfig  &g = config.gauges[i];
     if (r.detected) {
-      Serial.printf("[CV] M%d %-16s  angle=%7.2f deg  value=%6.3f %s  conf=%.3f  dark=%.1f\n",
-        g.id, g.name.c_str(), r.angleDeg, r.value, g.unit.c_str(), r.confidence, r.darkness);
+      Serial.printf("[CV] M%d %-16s  mode=%s  angle=%7.2f deg  value=%6.3f %s  conf=%.3f  dark=%.1f\n",
+        g.id, g.name.c_str(), g.analysisMode.c_str(), r.angleDeg, r.value, g.unit.c_str(), r.confidence, r.darkness);
     } else {
-      Serial.printf("[CV] M%d %-16s  NOT DETECTED\n", g.id, g.name.c_str());
+      Serial.printf("[CV] M%d %-16s  mode=%s  NOT DETECTED\n", g.id, g.name.c_str(), g.analysisMode.c_str());
     }
   }
 }
