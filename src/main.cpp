@@ -847,18 +847,12 @@ bool setupCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_RGB565;
 
-  // RGB565 is much heavier than JPEG; keep startup frame size conservative.
-  config.frame_size = FRAMESIZE_QVGA;
+  // Fixed stable resolution requested by user: 1024x768.
+  config.frame_size = FRAMESIZE_XGA;
   config.jpeg_quality = 16;
   config.fb_count = 1;
 
-  esp_err_t camErr = esp_camera_init(&config);
-  if (camErr != ESP_OK) {
-    Serial.printf("[CAM] Camera init failed at QVGA (0x%x), retry QQVGA\n", static_cast<unsigned>(camErr));
-    esp_camera_deinit();
-    config.frame_size = FRAMESIZE_QQVGA;
-    camErr = esp_camera_init(&config);
-  }
+  const esp_err_t camErr = esp_camera_init(&config);
 
   if (camErr != ESP_OK) {
     Serial.printf("[CAM] Camera init failed (0x%x)\n", static_cast<unsigned>(camErr));
