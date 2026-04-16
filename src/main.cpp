@@ -62,6 +62,31 @@ struct GaugeReading {
 };
 
 WebServer server(80);
+WiFiServer modbusServer(502);
+WiFiClient modbusClient;
+static const uint8_t kModbusUnitId = 1;
+
+static const uint16_t kModbusRegCount = 16;
+uint16_t modbusHolding[kModbusRegCount] = {0};
+
+enum ModbusRegister : uint16_t {
+  REG_STATUS = 0,
+  REG_G1_X100 = 1,
+  REG_G2_X100 = 2,
+  REG_DIFF_X100 = 3,
+  REG_CONF1_X1000 = 4,
+  REG_CONF2_X1000 = 5,
+  REG_UPTIME_LO = 6,
+  REG_UPTIME_HI = 7,
+  REG_WIFI_RSSI = 8,
+  REG_HEARTBEAT = 9,
+  REG_RESERVED10 = 10,
+  REG_RESERVED11 = 11,
+  REG_RESERVED12 = 12,
+  REG_RESERVED13 = 13,
+  REG_RESERVED14 = 14,
+  REG_RESERVED15 = 15
+};
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html>
@@ -106,6 +131,7 @@ pre{background:#0f172a;color:#e2e8f0;padding:.75rem;border-radius:8px;overflow:a
   <nav>
     <button class="active" onclick="tab('cam',this)">Kamera</button>
     <button onclick="tab('roi',this)">Kalibracja ROI</button>
+    <button onclick="tab('modbus',this)">Modbus</button>
   </nav>
 </div>
 
@@ -170,9 +196,24 @@ pre{background:#0f172a;color:#e2e8f0;padding:.75rem;border-radius:8px;overflow:a
   </div>
 </div>
 
+<div id="tab-modbus" class="page">
+  <div class="card">
+    <div class="row">
+      <button class="sec" onclick="loadModbusStatus()">&#8635; Odswiez status Modbus</button>
+    </div>
+    <h3 style="margin:0 0 .5rem">Parametry polaczenia</h3>
+    <pre id="modbus-conn">Ladowanie...</pre>
+    <h3 style="margin:1rem 0 .5rem">Stan urzadzenia</h3>
+    <pre id="modbus-state">Ladowanie...</pre>
+    <h3 style="margin:1rem 0 .5rem">Rejestry holding (0..15)</h3>
+    <pre id="modbus-regs">Ladowanie...</pre>
+  </div>
+</div>
+
 <script>
 const COLORS=['','#e11d48','#2563eb'];
 let mode=0;
+let modbusTimer=null;
 const canvas=document.getElementById('canvas');
 const ctx=canvas.getContext('2d');
 const cRoi=document.getElementById('canvas-roi');
@@ -184,7 +225,9 @@ function tab(id,btn){
   document.querySelectorAll('nav button').forEach(b=>b.classList.remove('active'));
   document.getElementById('tab-'+id).classList.add('active');
   btn.classList.add('active');
+  if(modbusTimer){clearInterval(modbusTimer);modbusTimer=null;}
   if(id==='roi'){loadRoiImg();updatePreview();}
+  if(id==='modbus'){loadModbusStatus();modbusTimer=setInterval(loadModbusStatus,2000);}
 }
 
 function loadCamImg(){
@@ -315,6 +358,33 @@ async function loadConfig(){
   applyConfig(await r.json());
 }
 
+function renderModbusRegisters(registers){
+  if(!Array.isArray(registers)||!registers.length)return 'Brak danych';
+  return registers.map(r=>{
+    return 'addr '+r.addr+' (4'+String(1+r.addr).padStart(4,'0')+')  u16='+r.u16+'  i16='+r.i16+'  hex='+r.hex;
+  }).join('\n');
+}
+
+async function loadModbusStatus(){
+  const conn=document.getElementById('modbus-conn');
+  const state=document.getElementById('modbus-state');
+  const regs=document.getElementById('modbus-regs');
+  try{
+    const r=await fetch('/modbus/status');
+    if(!r.ok){
+      const t=await r.text();
+      conn.textContent='Blad odczytu: '+(t||r.status);
+      return;
+    }
+    const data=await r.json();
+    conn.textContent='IP: '+data.ip+'\nPort: '+data.port+'\nUnit ID: '+data.unit_id+'\nFunkcja: '+data.function;
+    state.textContent='WiFi: '+data.wifi_status+'\nRSSI: '+data.rssi_dbm+' dBm\nHeartbeat: '+data.heartbeat;
+    regs.textContent=renderModbusRegisters(data.registers);
+  }catch(e){
+    conn.textContent='Blad: '+e;
+  }
+}
+
 loadCamImg();
 loadConfig();
 </script>
@@ -381,6 +451,12 @@ String jsonEscape(const String &value) {
     escaped += c;
   }
   return escaped;
+}
+
+String hex4(uint16_t value) {
+  char buf[5];
+  snprintf(buf, sizeof(buf), "%04X", value);
+  return String(buf);
 }
 
 bool jsonExtractNumber(const String &source, const char *key, float &value) {
@@ -561,6 +637,52 @@ float clamp01(float value) {
   if (value < 0.0f) return 0.0f;
   if (value > 1.0f) return 1.0f;
   return value;
+}
+
+int16_t scaledToI16(float value, float scale) {
+  const float scaled = value * scale;
+  if (scaled > 32767.0f) return 32767;
+  if (scaled < -32768.0f) return -32768;
+  return static_cast<int16_t>(lroundf(scaled));
+}
+
+void setRegisterS16(uint16_t index, int16_t value) {
+  if (index >= kModbusRegCount) return;
+  modbusHolding[index] = static_cast<uint16_t>(value);
+}
+
+void setRegisterU16(uint16_t index, uint16_t value) {
+  if (index >= kModbusRegCount) return;
+  modbusHolding[index] = value;
+}
+
+void updateSystemRegisters(uint32_t nowMs) {
+  const uint32_t uptimeSeconds = nowMs / 1000;
+  setRegisterU16(REG_UPTIME_LO, static_cast<uint16_t>(uptimeSeconds & 0xFFFF));
+  setRegisterU16(REG_UPTIME_HI, static_cast<uint16_t>((uptimeSeconds >> 16) & 0xFFFF));
+
+  if (WiFi.status() == WL_CONNECTED) {
+    setRegisterS16(REG_WIFI_RSSI, static_cast<int16_t>(WiFi.RSSI()));
+  } else {
+    setRegisterS16(REG_WIFI_RSSI, -32768);
+  }
+}
+
+void updateAnalysisRegisters(const GaugeReading readings[]) {
+  const bool g1Detected = readings[0].detected;
+  const bool g2Detected = readings[1].detected;
+
+  uint16_t status = 0;
+  if (!g1Detected && !g2Detected) status = 13;
+  else if (!g1Detected) status = 11;
+  else if (!g2Detected) status = 12;
+  setRegisterU16(REG_STATUS, status);
+
+  setRegisterS16(REG_G1_X100, g1Detected ? scaledToI16(readings[0].value, 100.0f) : -32768);
+  setRegisterS16(REG_G2_X100, g2Detected ? scaledToI16(readings[1].value, 100.0f) : -32768);
+  setRegisterS16(REG_DIFF_X100, (g1Detected && g2Detected) ? scaledToI16(readings[0].value - readings[1].value, 100.0f) : -32768);
+  setRegisterU16(REG_CONF1_X1000, g1Detected ? static_cast<uint16_t>(lroundf(clamp01(readings[0].confidence) * 1000.0f)) : 0);
+  setRegisterU16(REG_CONF2_X1000, g2Detected ? static_cast<uint16_t>(lroundf(clamp01(readings[1].confidence) * 1000.0f)) : 0);
 }
 
 float angleToValue(float angleDeg, const GaugeConfig &gauge) {
@@ -748,6 +870,7 @@ void handleAnalyze() {
   for (uint8_t i = 0; i < kGaugeCount; ++i) {
     readings[i] = analyzeGauge(fb, config.gauges[i]);
   }
+  updateAnalysisRegisters(readings);
 
   const int frameWidth = fb->width;
   const int frameHeight = fb->height;
@@ -822,6 +945,150 @@ void handleSaveConfig() {
   }
   Serial.println("[CFG] config.json saved");
   server.send(200, "text/plain", "ok");
+}
+
+String buildModbusStatusJson() {
+  const bool wifiOk = (WiFi.status() == WL_CONNECTED);
+  String json = "{";
+  json += "\"ip\":\"" + String(wifiOk ? WiFi.localIP().toString() : "-") + "\",";
+  json += "\"port\":502,";
+  json += "\"unit_id\":" + String(kModbusUnitId) + ',';
+  json += "\"function\":\"0x03\",";
+  json += "\"wifi_status\":\"" + String(wifiOk ? "connected" : "disconnected") + "\",";
+  json += "\"rssi_dbm\":" + String(static_cast<int16_t>(modbusHolding[REG_WIFI_RSSI])) + ',';
+  json += "\"heartbeat\":" + String(modbusHolding[REG_HEARTBEAT]) + ',';
+  json += "\"registers\":[";
+  for (uint16_t i = 0; i < kModbusRegCount; ++i) {
+    if (i > 0) json += ',';
+    const uint16_t raw = modbusHolding[i];
+    json += '{';
+    json += "\"addr\":" + String(i) + ',';
+    json += "\"reg\":" + String(40001 + i) + ',';
+    json += "\"u16\":" + String(raw) + ',';
+    json += "\"i16\":" + String(static_cast<int16_t>(raw)) + ',';
+    json += "\"hex\":\"0x" + hex4(raw) + "\"";
+    json += '}';
+  }
+  json += "]}";
+  return json;
+}
+
+void handleGetModbusStatus() {
+  if (!checkAuth()) return;
+  server.send(200, "application/json", buildModbusStatusJson());
+}
+
+void writeModbusException(WiFiClient &client, const uint8_t *mbap, uint8_t unitId, uint8_t functionCode, uint8_t exceptionCode) {
+  uint8_t response[9];
+  response[0] = mbap[0];
+  response[1] = mbap[1];
+  response[2] = 0;
+  response[3] = 0;
+  response[4] = 0;
+  response[5] = 3;  // unit + fc + exception
+  response[6] = unitId;
+  response[7] = static_cast<uint8_t>(functionCode | 0x80);
+  response[8] = exceptionCode;
+  client.write(response, sizeof(response));
+}
+
+void handleModbusTcp() {
+  if (!modbusClient || !modbusClient.connected()) {
+    if (modbusClient) modbusClient.stop();
+    modbusClient = modbusServer.available();
+    return;
+  }
+
+  if (modbusClient.available() < 8) return;
+
+  uint8_t mbap[7];
+  if (modbusClient.readBytes(mbap, sizeof(mbap)) != sizeof(mbap)) return;
+
+  const uint16_t protocolId = static_cast<uint16_t>((mbap[2] << 8) | mbap[3]);
+  const uint16_t length = static_cast<uint16_t>((mbap[4] << 8) | mbap[5]);
+  const uint8_t unitId = mbap[6];
+
+  if (protocolId != 0 || length < 2 || length > 253) {
+    modbusClient.stop();
+    return;
+  }
+
+  // Respond only to our configured Modbus Unit ID.
+  if (unitId != kModbusUnitId) {
+    return;
+  }
+
+  const uint16_t bodyLen = static_cast<uint16_t>(length - 1);
+  const uint32_t waitStart = millis();
+  while (modbusClient.available() < bodyLen) {
+    if (millis() - waitStart > 100) return;
+    delay(0);
+  }
+
+  uint8_t body[253];
+  if (modbusClient.readBytes(body, bodyLen) != bodyLen) return;
+
+  const uint8_t functionCode = body[0];
+  if (functionCode != 0x03) {
+    writeModbusException(modbusClient, mbap, unitId, functionCode, 0x01);  // Illegal Function
+    return;
+  }
+
+  if (bodyLen < 5) {
+    writeModbusException(modbusClient, mbap, unitId, functionCode, 0x03);  // Illegal Data Value
+    return;
+  }
+
+  const uint16_t startAddr = static_cast<uint16_t>((body[1] << 8) | body[2]);
+  const uint16_t quantity = static_cast<uint16_t>((body[3] << 8) | body[4]);
+
+  // Accept both common client styles:
+  // - raw zero-based holding address: 0..15
+  // - 4xxxx-style numbers sent as start address: 40000..40015 or 40001..40016
+  uint16_t normalizedStart = startAddr;
+  if (startAddr >= 40001 && startAddr < static_cast<uint16_t>(40001 + kModbusRegCount)) {
+    normalizedStart = static_cast<uint16_t>(startAddr - 40001);
+  } else if (startAddr >= 40000 && startAddr < static_cast<uint16_t>(40000 + kModbusRegCount)) {
+    normalizedStart = static_cast<uint16_t>(startAddr - 40000);
+  }
+
+  if (quantity == 0 || quantity > 125) {
+    writeModbusException(modbusClient, mbap, unitId, functionCode, 0x03);
+    return;
+  }
+
+  if (normalizedStart + quantity > kModbusRegCount) {
+    writeModbusException(modbusClient, mbap, unitId, functionCode, 0x02);  // Illegal Data Address
+    return;
+  }
+
+  const uint8_t byteCount = static_cast<uint8_t>(quantity * 2);
+  const uint16_t respLength = static_cast<uint16_t>(3 + byteCount);  // unit + fc + byteCount + data
+
+  uint8_t response[260];
+  response[0] = mbap[0];
+  response[1] = mbap[1];
+  response[2] = 0;
+  response[3] = 0;
+  response[4] = static_cast<uint8_t>((respLength >> 8) & 0xFF);
+  response[5] = static_cast<uint8_t>(respLength & 0xFF);
+  response[6] = unitId;
+  response[7] = functionCode;
+  response[8] = byteCount;
+
+  uint16_t out = 9;
+  for (uint16_t i = 0; i < quantity; ++i) {
+    const uint16_t reg = modbusHolding[normalizedStart + i];
+    response[out++] = static_cast<uint8_t>((reg >> 8) & 0xFF);
+    response[out++] = static_cast<uint8_t>(reg & 0xFF);
+  }
+  modbusClient.write(response, out);
+}
+
+void setupModbusTcp() {
+  modbusServer.begin();
+  modbusServer.setNoDelay(true);
+  Serial.println("[MODBUS] TCP server started on port 502");
 }
 
 bool setupCamera() {
@@ -929,6 +1196,7 @@ void setupWebServer() {
   server.on("/photo.jpg", HTTP_GET, handlePhoto);
   server.on("/config", HTTP_GET, handleGetConfig);
   server.on("/config", HTTP_POST, handleSaveConfig);
+  server.on("/modbus/status", HTTP_GET, handleGetModbusStatus);
   server.begin();
   Serial.println("[WEB]  Server started on port 80");
 }
@@ -957,6 +1225,7 @@ void setup() {
 
   setupWiFi();
   setupWebServer();
+  setupModbusTcp();
 
   if (!captureAndSave()) Serial.println("[BOOT] Initial capture failed (continuing)");
 }
@@ -985,6 +1254,7 @@ static void runPeriodicAnalysis() {
   for (uint8_t i = 0; i < kGaugeCount; ++i) {
     readings[i] = analyzeGauge(fb, config.gauges[i]);
   }
+  updateAnalysisRegisters(readings);
 
   const int frameWidth = fb->width;
   const int frameHeight = fb->height;
@@ -1014,12 +1284,15 @@ static uint32_t lastHeartbeatMs = 0;
 
 void loop() {
   server.handleClient();
+  handleModbusTcp();
 
   const uint32_t now = millis();
+  updateSystemRegisters(now);
   maintainWiFi(now);
 
   if (now - lastHeartbeatMs >= kHeartbeatIntervalMs) {
     lastHeartbeatMs = now;
+    setRegisterU16(REG_HEARTBEAT, static_cast<uint16_t>(modbusHolding[REG_HEARTBEAT] + 1));
     const bool wifiOk = (WiFi.status() == WL_CONNECTED);
     Serial.printf("[SYS] alive uptime=%lus wifi=%s ip=%s\n",
       static_cast<unsigned long>(now / 1000),
