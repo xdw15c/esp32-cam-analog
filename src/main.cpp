@@ -27,6 +27,13 @@
 #define VSYNC_GPIO_NUM 25
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
+#define FLASH_LED_GPIO_NUM 4
+
+static const uint16_t kFlashWarmupMs = 70;
+static bool gFlashEnabled = true;
+static uint32_t gAnalysisIntervalMs = 60000;
+static const uint32_t kMinAnalysisIntervalMs = 10000;
+static const uint32_t kMaxAnalysisIntervalMs = 3600000;
 
 static const char *kPhotoPath = "/latest.jpg";
 static const char *kConfigPath = "/config/config.json";
@@ -52,7 +59,8 @@ struct GaugeConfig {
 
 struct DeviceConfig {
   String deviceId = "esp32cam-01";
-  int intervalS = 2;
+  int intervalS = 60;
+  bool flashEnabled = true;
   GaugeConfig gauges[kGaugeCount];
   bool loaded = false;
 };
@@ -72,6 +80,8 @@ static const uint8_t kModbusUnitId = 1;
 
 static const uint16_t kModbusRegCount = 16;
 uint16_t modbusHolding[kModbusRegCount] = {0};
+
+camera_fb_t *captureFrameWithFlash();
 
 enum ModbusRegister : uint16_t {
   REG_STATUS = 0,
@@ -241,6 +251,16 @@ select,input[type=color]{width:100%;border:1px solid #cbd5e1;border-radius:6px;p
     </div>
   </div>
   <div class="card" style="margin-top:1rem">
+    <div class="cfg-ana">
+      <h3 style="margin:0 0 .5rem">Ustawienia urzadzenia</h3>
+      <label style="display:flex;align-items:center;gap:.5rem;color:#1e293b;margin:.2rem 0 .6rem">
+        <input type="checkbox" id="flash-enabled" checked onchange="updatePreview()">
+        Uzyj diody flash podczas robienia zdjecia
+      </label>
+      <label>Czas pomiedzy automatycznym zdjeciem i analiza (sekundy)</label>
+      <input type="number" id="auto-interval-s" min="10" max="3600" value="60" oninput="updatePreview()">
+      <p class="hint" style="margin-top:.4rem">Zakres: 10..3600 s</p>
+    </div>
     <h3 style="margin:0 0 .5rem">config.json (podglad)</h3>
     <pre id="cfg-pre">{}</pre>
   </div>
@@ -367,8 +387,11 @@ cRoi.addEventListener('click',ev=>{
 });
 
 function buildConfig(){
+  const autoInterval=Math.max(10,Math.min(3600,gv('auto-interval-s')||60));
   return{
-    device_id:'esp32cam-01',interval_s:2,
+    device_id:'esp32cam-01',
+    interval_s:autoInterval,
+    flash_enabled:!!document.getElementById('flash-enabled').checked,
     gauges:[1,2].map(n=>{
       const p='g'+n;
       return{id:n,name:document.getElementById(p+'-name').value,
@@ -386,6 +409,10 @@ function buildConfig(){
 
 function applyConfig(cfg){
   if(!cfg||!Array.isArray(cfg.gauges))return;
+  const flashEl=document.getElementById('flash-enabled');
+  const intervalEl=document.getElementById('auto-interval-s');
+  if(flashEl)flashEl.checked=(cfg.flash_enabled!==false);
+  if(intervalEl)intervalEl.value=Math.max(10,Math.min(3600,(+cfg.interval_s)||60));
   cfg.gauges.forEach(g=>{
     const n=g.id,p='g'+n;
     const s=(id,v)=>{const el=document.getElementById(id);if(el&&v!==undefined)el.value=v;};
@@ -594,6 +621,30 @@ bool jsonExtractString(const String &source, const char *key, String &value) {
   return true;
 }
 
+bool jsonExtractBool(const String &source, const char *key, bool &value) {
+  const String pattern = String("\"") + key + '"';
+  int start = source.indexOf(pattern);
+  if (start < 0) return false;
+
+  start = source.indexOf(':', start);
+  if (start < 0) return false;
+  ++start;
+
+  while (start < static_cast<int>(source.length()) && isspace(static_cast<unsigned char>(source[start]))) {
+    ++start;
+  }
+
+  if (source.startsWith("true", start)) {
+    value = true;
+    return true;
+  }
+  if (source.startsWith("false", start)) {
+    value = false;
+    return true;
+  }
+  return false;
+}
+
 bool parseGaugeConfig(const String &objectText, GaugeConfig &gauge) {
   gauge = GaugeConfig();
   if (!jsonExtractInt(objectText, "id", gauge.id)) return false;
@@ -654,6 +705,7 @@ bool loadDeviceConfig(DeviceConfig &config) {
 
   jsonExtractString(json, "device_id", config.deviceId);
   jsonExtractInt(json, "interval_s", config.intervalS);
+  jsonExtractBool(json, "flash_enabled", config.flashEnabled);
 
   String legacyMode = "color_target";
   String legacyNeedle = "#D00000";
@@ -721,6 +773,15 @@ bool loadDeviceConfig(DeviceConfig &config) {
 
   config.loaded = true;
   return true;
+}
+
+void applyRuntimeSettings(const DeviceConfig &config) {
+  gFlashEnabled = config.flashEnabled;
+
+  int intervalS = config.intervalS;
+  if (intervalS < static_cast<int>(kMinAnalysisIntervalMs / 1000)) intervalS = static_cast<int>(kMinAnalysisIntervalMs / 1000);
+  if (intervalS > static_cast<int>(kMaxAnalysisIntervalMs / 1000)) intervalS = static_cast<int>(kMaxAnalysisIntervalMs / 1000);
+  gAnalysisIntervalMs = static_cast<uint32_t>(intervalS) * 1000UL;
 }
 
 bool saveFrameAsJpeg(camera_fb_t *fb, const char *path) {
@@ -1116,7 +1177,7 @@ String buildAnalysisJson(const DeviceConfig &config, const GaugeReading readings
 }
 
 bool captureAndSave() {
-  camera_fb_t *fb = esp_camera_fb_get();
+  camera_fb_t *fb = captureFrameWithFlash();
   if (!fb) {
     Serial.println("[CAM] Frame capture failed");
     return false;
@@ -1156,9 +1217,10 @@ void handleAnalyze() {
     server.send(409, "text/plain", "calibration_missing_or_invalid");
     return;
   }
+  applyRuntimeSettings(config);
 
   const uint32_t start = millis();
-  camera_fb_t *fb = esp_camera_fb_get();
+  camera_fb_t *fb = captureFrameWithFlash();
   if (!fb) {
     server.send(500, "text/plain", "capture_failed");
     return;
@@ -1246,6 +1308,10 @@ void handleSaveConfig() {
   if (!sdWriteText(kConfigPath, body)) {
     server.send(500, "text/plain", "write_failed");
     return;
+  }
+  DeviceConfig config;
+  if (loadDeviceConfig(config)) {
+    applyRuntimeSettings(config);
   }
   Serial.println("[CFG] config.json saved");
   server.send(200, "text/plain", "ok");
@@ -1395,6 +1461,28 @@ void setupModbusTcp() {
   Serial.println("[MODBUS] TCP server started on port 502");
 }
 
+void setFlashLed(bool enabled) {
+  if (!gFlashEnabled) {
+    digitalWrite(FLASH_LED_GPIO_NUM, LOW);
+    return;
+  }
+  digitalWrite(FLASH_LED_GPIO_NUM, enabled ? HIGH : LOW);
+}
+
+void setupFlashLed() {
+  pinMode(FLASH_LED_GPIO_NUM, OUTPUT);
+  setFlashLed(false);
+  Serial.println("[FLASH] LED ready");
+}
+
+camera_fb_t *captureFrameWithFlash() {
+  setFlashLed(true);
+  delay(kFlashWarmupMs);
+  camera_fb_t *fb = esp_camera_fb_get();
+  setFlashLed(false);
+  return fb;
+}
+
 bool setupCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -1511,6 +1599,8 @@ void setup() {
   Serial.println();
   Serial.println("[BOOT] ESP32-CAM Manometry v0.3");
 
+  setupFlashLed();
+
   if (!setupStorage()) {
     Serial.println("[BOOT] Fatal: storage setup failed");
     while (true) {
@@ -1531,6 +1621,11 @@ void setup() {
   setupWebServer();
   setupModbusTcp();
 
+  DeviceConfig config;
+  if (loadDeviceConfig(config)) {
+    applyRuntimeSettings(config);
+  }
+
   if (!captureAndSave()) Serial.println("[BOOT] Initial capture failed (continuing)");
 }
 
@@ -1540,8 +1635,9 @@ static void runPeriodicAnalysis() {
     Serial.println("[CV] Periodic: calibration missing, skipping");
     return;
   }
+  applyRuntimeSettings(config);
 
-  camera_fb_t *fb = esp_camera_fb_get();
+  camera_fb_t *fb = captureFrameWithFlash();
   if (!fb) {
     Serial.println("[CV] Periodic: capture failed");
     return;
@@ -1579,10 +1675,9 @@ static void runPeriodicAnalysis() {
   }
 }
 
-static const uint32_t kAnalysisIntervalMs = 30000;
 static uint32_t lastAnalysisMs = 0;
 static volatile bool analysisInProgress = false;
-static const bool kEnablePeriodicAnalysis = false;
+static const bool kEnablePeriodicAnalysis = true;
 static const uint32_t kHeartbeatIntervalMs = 10000;
 static uint32_t lastHeartbeatMs = 0;
 
@@ -1604,7 +1699,7 @@ void loop() {
       wifiOk ? WiFi.localIP().toString().c_str() : "-");
   }
 
-  if (kEnablePeriodicAnalysis && !analysisInProgress && (now - lastAnalysisMs >= kAnalysisIntervalMs)) {
+  if (kEnablePeriodicAnalysis && !analysisInProgress && (now - lastAnalysisMs >= gAnalysisIntervalMs)) {
     lastAnalysisMs = now;
     analysisInProgress = true;
     runPeriodicAnalysis();
