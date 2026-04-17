@@ -34,6 +34,38 @@ static bool gFlashEnabled = true;
 static uint32_t gAnalysisIntervalMs = 60000;
 static const uint32_t kMinAnalysisIntervalMs = 10000;
 static const uint32_t kMaxAnalysisIntervalMs = 3600000;
+static bool gStorageReady = false;
+static bool gCameraReady = false;
+static bool gEmergencyMode = false;
+
+static const uint32_t kEmergencyBlinkIntervalMs = 10000;
+static const uint16_t kEmergencyBlinkPulseMs = 120;
+static const uint16_t kEmergencyBlinkIntraPauseMs = 220;
+static const uint16_t kEmergencyBlinkStepPauseMs = 900;
+
+enum class EmergencyFault : uint8_t {
+  None = 0,
+  Storage = 1,
+  Camera = 2,
+  StorageAndCamera = 3
+};
+
+static EmergencyFault gEmergencyFault = EmergencyFault::None;
+static uint8_t gEmergencyBlinkTargetCount = 2;
+static uint8_t gEmergencyBlinkDoneCount = 0;
+
+enum class EmergencyBlinkState : uint8_t {
+  Idle = 0,
+  On1,
+  Off1,
+  On2,
+  Off2,
+  BetweenSteps
+};
+
+static EmergencyBlinkState gEmergencyBlinkState = EmergencyBlinkState::Idle;
+static uint32_t gEmergencyBlinkStateMs = 0;
+static uint32_t gEmergencyNextBlinkMs = 0;
 
 static const char *kPhotoPath = "/latest.jpg";
 static const char *kConfigPath = "/config/config.json";
@@ -198,6 +230,7 @@ select,input[type=color]{width:100%;border:1px solid #cbd5e1;border-radius:6px;p
         <select id="g1-analysis-mode" onchange="onGaugeAnalysisModeChanged(1);updatePreview();">
           <option value="classic_darkness">Klasyczna (najciemniejsza wskazowka)</option>
           <option value="color_target">Kolorowa (wskazany kolor wskazowki)</option>
+          <option value="hybrid_pca_hough">Hybrydowa (PCA blob + mini-Hough)</option>
         </select>
         <div id="g1-color-settings" class="cfg-ana-grid">
           <div>
@@ -232,6 +265,7 @@ select,input[type=color]{width:100%;border:1px solid #cbd5e1;border-radius:6px;p
         <select id="g2-analysis-mode" onchange="onGaugeAnalysisModeChanged(2);updatePreview();">
           <option value="classic_darkness">Klasyczna (najciemniejsza wskazowka)</option>
           <option value="color_target">Kolorowa (wskazany kolor wskazowki)</option>
+          <option value="hybrid_pca_hough">Hybrydowa (PCA blob + mini-Hough)</option>
         </select>
         <div id="g2-color-settings" class="cfg-ana-grid">
           <div>
@@ -744,10 +778,10 @@ bool loadDeviceConfig(DeviceConfig &config) {
     if (objectEnd < 0) break;
     GaugeConfig gauge;
     if (parseGaugeConfig(json.substring(objectStart, objectEnd + 1), gauge)) {
-      if (gauge.analysisMode != "classic_darkness" && gauge.analysisMode != "color_target") {
+      if (gauge.analysisMode != "classic_darkness" && gauge.analysisMode != "color_target" && gauge.analysisMode != "hybrid_pca_hough") {
         gauge.analysisMode = legacyMode;
       }
-      if (gauge.analysisMode != "classic_darkness" && gauge.analysisMode != "color_target") {
+      if (gauge.analysisMode != "classic_darkness" && gauge.analysisMode != "color_target" && gauge.analysisMode != "hybrid_pca_hough") {
         gauge.analysisMode = "color_target";
       }
 
@@ -928,6 +962,225 @@ float colorDistanceSq(uint8_t r1, uint8_t g1, uint8_t b1, uint8_t r2, uint8_t g2
   const float dg = static_cast<float>(g1) - g2;
   const float db = static_cast<float>(b1) - b2;
   return dr * dr + dg * dg + db * db;
+}
+
+float normalizeAngle180(float angleDeg) {
+  while (angleDeg <= -180.0f) angleDeg += 360.0f;
+  while (angleDeg > 180.0f) angleDeg -= 360.0f;
+  return angleDeg;
+}
+
+float toGaugeAngleDeg(float angleRad) {
+  return normalizeAngle180((angleRad * 180.0f / PI) + 90.0f);
+}
+
+float angleDistanceDeg(float a, float b) {
+  return fabsf(normalizeAngle180(a - b));
+}
+
+bool angleWithinGaugeRange(float angleDeg, const GaugeConfig &gauge) {
+  const float start = min(gauge.angleMin, gauge.angleMax);
+  const float end = max(gauge.angleMin, gauge.angleMax);
+  return angleDeg >= start && angleDeg <= end;
+}
+
+struct HybridLineScore {
+  float score = 0.0f;
+  float grayLevel = 255.0f;
+  uint16_t hits = 0;
+  uint16_t samples = 0;
+};
+
+HybridLineScore scoreNeedleLineHybrid(const camera_fb_t *fb, const GaugeConfig &gauge, float angleDeg, uint8_t darkThreshold) {
+  HybridLineScore result;
+  const float angleRad = angleToRadians(angleDeg);
+  const float dirX = cosf(angleRad);
+  const float dirY = sinf(angleRad);
+  const float perpX = -dirY;
+  const float perpY = dirX;
+  const float startRadius = gauge.radius * 0.20f;
+  const float endRadius = gauge.radius * 0.98f;
+  const float step = max(1.0f, gauge.radius / 34.0f);
+
+  uint32_t graySum = 0;
+  uint16_t iter = 0;
+  for (float radius = startRadius; radius <= endRadius; radius += step) {
+    for (int offset = -1; offset <= 1; ++offset) {
+      const int x = lroundf(gauge.cx + dirX * radius + perpX * offset);
+      const int y = lroundf(gauge.cy + dirY * radius + perpY * offset);
+      uint8_t gray = 0;
+      if (!sampleGray(fb, x, y, gray)) continue;
+      graySum += gray;
+      ++result.samples;
+      if (gray <= darkThreshold) ++result.hits;
+      ++iter;
+      if ((iter % 220) == 0) {
+        delay(0);
+      }
+    }
+  }
+
+  if (result.samples == 0) return result;
+
+  result.grayLevel = static_cast<float>(graySum) / result.samples;
+  const float hitRatio = static_cast<float>(result.hits) / result.samples;
+  const float darknessBoost = max(0.0f, static_cast<float>(darkThreshold) - result.grayLevel);
+  result.score = (result.hits * 1.25f) + (hitRatio * 100.0f) + (darknessBoost * 0.16f);
+  return result;
+}
+
+GaugeReading analyzeGaugeHybrid(const camera_fb_t *fb, const GaugeConfig &gauge) {
+  GaugeReading reading;
+  if (!gauge.valid || !fb || fb->format != PIXFORMAT_RGB565) return reading;
+
+  const float ringInner = gauge.radius * 0.16f;
+  const float ringOuter = gauge.radius * 1.00f;
+  const float ringInner2 = ringInner * ringInner;
+  const float ringOuter2 = ringOuter * ringOuter;
+
+  // Pass 1: estimate adaptive darkness threshold from gauge annulus.
+  uint32_t sumGray = 0;
+  uint32_t sumSqGray = 0;
+  uint16_t statsCount = 0;
+  for (int y = gauge.cy - gauge.radius; y <= gauge.cy + gauge.radius; y += 2) {
+    for (int x = gauge.cx - gauge.radius; x <= gauge.cx + gauge.radius; x += 2) {
+      const float dx = static_cast<float>(x - gauge.cx);
+      const float dy = static_cast<float>(y - gauge.cy);
+      const float d2 = dx * dx + dy * dy;
+      if (d2 < ringInner2 || d2 > ringOuter2) continue;
+
+      uint8_t gray = 0;
+      if (!sampleGray(fb, x, y, gray)) continue;
+      sumGray += gray;
+      sumSqGray += static_cast<uint32_t>(gray) * gray;
+      ++statsCount;
+    }
+    delay(0);
+  }
+
+  if (statsCount < 90) return reading;
+
+  const float meanGray = static_cast<float>(sumGray) / statsCount;
+  float variance = (static_cast<float>(sumSqGray) / statsCount) - (meanGray * meanGray);
+  if (variance < 0.0f) variance = 0.0f;
+  const float stdDev = sqrtf(variance);
+  float thresholdF = meanGray - (10.0f + stdDev * 0.55f);
+  if (thresholdF < 35.0f) thresholdF = 35.0f;
+  if (thresholdF > 185.0f) thresholdF = 185.0f;
+  const uint8_t darkThreshold = static_cast<uint8_t>(lroundf(thresholdF));
+
+  // Pass 2: PCA over dark pixels to estimate dominant needle axis.
+  float sumW = 0.0f;
+  float sxx = 0.0f;
+  float sxy = 0.0f;
+  float syy = 0.0f;
+  uint16_t darkCount = 0;
+  for (int y = gauge.cy - gauge.radius; y <= gauge.cy + gauge.radius; y += 2) {
+    for (int x = gauge.cx - gauge.radius; x <= gauge.cx + gauge.radius; x += 2) {
+      const float dx = static_cast<float>(x - gauge.cx);
+      const float dy = static_cast<float>(y - gauge.cy);
+      const float d2 = dx * dx + dy * dy;
+      if (d2 < ringInner2 || d2 > ringOuter2) continue;
+
+      uint8_t gray = 0;
+      if (!sampleGray(fb, x, y, gray)) continue;
+      if (gray > darkThreshold) continue;
+
+      const float weight = static_cast<float>((darkThreshold - gray) + 1);
+      sxx += dx * dx * weight;
+      sxy += dx * dy * weight;
+      syy += dy * dy * weight;
+      sumW += weight;
+      ++darkCount;
+    }
+    delay(0);
+  }
+
+  if (darkCount < 40 || sumW < 1.0f) return reading;
+
+  const float covXX = sxx / sumW;
+  const float covXY = sxy / sumW;
+  const float covYY = syy / sumW;
+  const float pcaAngleRad = 0.5f * atan2f(2.0f * covXY, covXX - covYY);
+  const float pcaAngleA = toGaugeAngleDeg(pcaAngleRad);
+  const float pcaAngleB = normalizeAngle180(pcaAngleA + 180.0f);
+
+  // Anisotropy close to 1 means elongated shape (good pointer-like blob).
+  const float trace = covXX + covYY;
+  const float detPart = (covXX - covYY) * (covXX - covYY) + 4.0f * covXY * covXY;
+  const float rootTerm = detPart > 0.0f ? sqrtf(detPart) : 0.0f;
+  const float lambda1 = 0.5f * (trace + rootTerm);
+  const float lambda2 = 0.5f * (trace - rootTerm);
+  const float anisotropy = clamp01((lambda1 - lambda2) / max(1.0f, lambda1 + lambda2));
+
+  HybridLineScore scoreA = scoreNeedleLineHybrid(fb, gauge, pcaAngleA, darkThreshold);
+  HybridLineScore scoreB = scoreNeedleLineHybrid(fb, gauge, pcaAngleB, darkThreshold);
+
+  float seedAngle = pcaAngleA;
+  HybridLineScore seedScore = scoreA;
+  const bool inRangeA = angleWithinGaugeRange(pcaAngleA, gauge);
+  const bool inRangeB = angleWithinGaugeRange(pcaAngleB, gauge);
+  if (!inRangeA && inRangeB) {
+    seedAngle = pcaAngleB;
+    seedScore = scoreB;
+  } else if (inRangeA == inRangeB && scoreB.score > scoreA.score) {
+    seedAngle = pcaAngleB;
+    seedScore = scoreB;
+  }
+
+  // Pass 3: mini-Hough around PCA estimate for robust angle refinement.
+  constexpr float kRefineWindowDeg = 18.0f;
+  constexpr float kRefineStepDeg = 1.0f;
+  constexpr int kMaxRefine = 41;
+  float refineAngles[kMaxRefine];
+  HybridLineScore refineScores[kMaxRefine];
+  int refineCount = 0;
+
+  for (float delta = -kRefineWindowDeg; delta <= kRefineWindowDeg && refineCount < kMaxRefine; delta += kRefineStepDeg) {
+    const float candidate = normalizeAngle180(seedAngle + delta);
+    refineAngles[refineCount] = candidate;
+    refineScores[refineCount] = scoreNeedleLineHybrid(fb, gauge, candidate, darkThreshold);
+    ++refineCount;
+  }
+
+  if (refineCount == 0) return reading;
+
+  int bestIndex = 0;
+  for (int i = 1; i < refineCount; ++i) {
+    if (refineScores[i].score > refineScores[bestIndex].score) bestIndex = i;
+  }
+
+  int secondIndex = -1;
+  for (int i = 0; i < refineCount; ++i) {
+    if (i == bestIndex) continue;
+    if (angleDistanceDeg(refineAngles[i], refineAngles[bestIndex]) < 3.1f) continue;
+    if (secondIndex < 0 || refineScores[i].score > refineScores[secondIndex].score) secondIndex = i;
+  }
+
+  const float bestScore = refineScores[bestIndex].score;
+  const float secondScore = secondIndex >= 0 ? refineScores[secondIndex].score : seedScore.score;
+  const float contrast = max(0.0f, bestScore - secondScore);
+  const float hitRatio = (refineScores[bestIndex].samples > 0)
+    ? (static_cast<float>(refineScores[bestIndex].hits) / refineScores[bestIndex].samples)
+    : 0.0f;
+
+  float confidence = 0.0f;
+  confidence += 0.42f * anisotropy;
+  confidence += 0.38f * clamp01(contrast / 42.0f);
+  confidence += 0.20f * clamp01((hitRatio - 0.15f) / 0.55f);
+  confidence = clamp01(confidence);
+
+  const bool insideRange = angleWithinGaugeRange(refineAngles[bestIndex], gauge);
+  if (!insideRange || refineScores[bestIndex].hits < 10 || hitRatio < 0.18f || confidence < 0.10f) {
+    return reading;
+  }
+
+  reading.detected = true;
+  reading.angleDeg = refineAngles[bestIndex];
+  reading.value = angleToValue(reading.angleDeg, gauge);
+  reading.confidence = confidence;
+  reading.darkness = refineScores[bestIndex].grayLevel;
+  return reading;
 }
 
 float scoreClassicDarkness(const camera_fb_t *fb, const GaugeConfig &gauge, float angleDeg, float &grayLevel) {
@@ -1135,6 +1388,9 @@ GaugeReading analyzeGauge(const camera_fb_t *fb, const GaugeConfig &gauge) {
   if (gauge.analysisMode == "classic_darkness") {
     return analyzeGaugeClassic(fb, gauge);
   }
+  if (gauge.analysisMode == "hybrid_pca_hough") {
+    return analyzeGaugeHybrid(fb, gauge);
+  }
   const AnalysisColorProfile profile = buildColorProfile(gauge);
   return analyzeGaugeColor(fb, gauge, profile);
 }
@@ -1177,6 +1433,15 @@ String buildAnalysisJson(const DeviceConfig &config, const GaugeReading readings
 }
 
 bool captureAndSave() {
+  if (!gCameraReady) {
+    Serial.println("[CAM] Camera not ready");
+    return false;
+  }
+  if (!gStorageReady) {
+    Serial.println("[SD] Storage not ready");
+    return false;
+  }
+
   camera_fb_t *fb = captureFrameWithFlash();
   if (!fb) {
     Serial.println("[CAM] Frame capture failed");
@@ -1211,6 +1476,15 @@ void handleCapture() {
 
 void handleAnalyze() {
   if (!checkAuth()) return;
+
+  if (!gCameraReady) {
+    server.send(503, "text/plain", "camera_not_ready");
+    return;
+  }
+  if (!gStorageReady) {
+    server.send(503, "text/plain", "storage_not_ready");
+    return;
+  }
 
   DeviceConfig config;
   if (!loadDeviceConfig(config)) {
@@ -1266,6 +1540,10 @@ void handleAnalyze() {
 
 void handlePhoto() {
   if (!checkAuth()) return;
+  if (!gStorageReady) {
+    server.send(503, "text/plain", "storage_not_ready");
+    return;
+  }
   if (!SD_MMC.exists(kPhotoPath)) {
     server.send(404, "text/plain", "photo_not_found");
     return;
@@ -1281,6 +1559,10 @@ void handlePhoto() {
 
 void handleGetConfig() {
   if (!checkAuth()) return;
+  if (!gStorageReady) {
+    server.send(503, "text/plain", "storage_not_ready");
+    return;
+  }
   if (!SD_MMC.exists(kConfigPath)) {
     server.send(404, "text/plain", "config_not_found");
     return;
@@ -1296,6 +1578,10 @@ void handleGetConfig() {
 
 void handleSaveConfig() {
   if (!checkAuth()) return;
+  if (!gStorageReady) {
+    server.send(503, "text/plain", "storage_not_ready");
+    return;
+  }
   const String body = server.arg("plain");
   if (body.length() == 0) {
     server.send(400, "text/plain", "empty_body");
@@ -1461,12 +1747,54 @@ void setupModbusTcp() {
   Serial.println("[MODBUS] TCP server started on port 502");
 }
 
+void setEmergencyMode(bool enabled, const char *reason) {
+  gEmergencyMode = enabled;
+  if (enabled) {
+    gEmergencyBlinkState = EmergencyBlinkState::Idle;
+    gEmergencyBlinkStateMs = millis();
+    gEmergencyNextBlinkMs = millis();
+    gEmergencyBlinkDoneCount = 0;
+    Serial.printf("[SAFE] Emergency mode enabled: %s\n", reason ? reason : "unknown");
+  } else {
+    gEmergencyBlinkState = EmergencyBlinkState::Idle;
+    gEmergencyBlinkStateMs = millis();
+    gEmergencyNextBlinkMs = 0;
+    gEmergencyFault = EmergencyFault::None;
+    gEmergencyBlinkDoneCount = 0;
+    gEmergencyBlinkTargetCount = 2;
+    Serial.println("[SAFE] Emergency mode disabled");
+  }
+}
+
+void setEmergencyFault(EmergencyFault fault) {
+  gEmergencyFault = fault;
+  switch (fault) {
+    case EmergencyFault::Storage:
+      gEmergencyBlinkTargetCount = 2;
+      break;
+    case EmergencyFault::Camera:
+      gEmergencyBlinkTargetCount = 3;
+      break;
+    case EmergencyFault::StorageAndCamera:
+      gEmergencyBlinkTargetCount = 4;
+      break;
+    case EmergencyFault::None:
+    default:
+      gEmergencyBlinkTargetCount = 2;
+      break;
+  }
+}
+
+void writeFlashLedRaw(bool enabled) {
+  digitalWrite(FLASH_LED_GPIO_NUM, enabled ? HIGH : LOW);
+}
+
 void setFlashLed(bool enabled) {
   if (!gFlashEnabled) {
-    digitalWrite(FLASH_LED_GPIO_NUM, LOW);
+    writeFlashLedRaw(false);
     return;
   }
-  digitalWrite(FLASH_LED_GPIO_NUM, enabled ? HIGH : LOW);
+  writeFlashLedRaw(enabled);
 }
 
 void setupFlashLed() {
@@ -1475,7 +1803,73 @@ void setupFlashLed() {
   Serial.println("[FLASH] LED ready");
 }
 
+void maintainEmergencyFlash(uint32_t nowMs) {
+  if (!gEmergencyMode) {
+    gEmergencyBlinkState = EmergencyBlinkState::Idle;
+    writeFlashLedRaw(false);
+    return;
+  }
+
+  switch (gEmergencyBlinkState) {
+    case EmergencyBlinkState::Idle:
+      if ((int32_t)(nowMs - gEmergencyNextBlinkMs) >= 0) {
+        gEmergencyBlinkDoneCount = 0;
+        writeFlashLedRaw(true);
+        gEmergencyBlinkState = EmergencyBlinkState::On1;
+        gEmergencyBlinkStateMs = nowMs;
+      }
+      break;
+
+    case EmergencyBlinkState::On1:
+      if (nowMs - gEmergencyBlinkStateMs >= kEmergencyBlinkPulseMs) {
+        writeFlashLedRaw(false);
+        gEmergencyBlinkState = EmergencyBlinkState::Off1;
+        gEmergencyBlinkStateMs = nowMs;
+      }
+      break;
+
+    case EmergencyBlinkState::Off1:
+      if (nowMs - gEmergencyBlinkStateMs >= kEmergencyBlinkIntraPauseMs) {
+        writeFlashLedRaw(true);
+        gEmergencyBlinkState = EmergencyBlinkState::On2;
+        gEmergencyBlinkStateMs = nowMs;
+      }
+      break;
+
+    case EmergencyBlinkState::On2:
+      if (nowMs - gEmergencyBlinkStateMs >= kEmergencyBlinkPulseMs) {
+        writeFlashLedRaw(false);
+        gEmergencyBlinkState = EmergencyBlinkState::Off2;
+        gEmergencyBlinkStateMs = nowMs;
+      }
+      break;
+
+    case EmergencyBlinkState::Off2:
+      if (nowMs - gEmergencyBlinkStateMs >= kEmergencyBlinkIntraPauseMs) {
+        ++gEmergencyBlinkDoneCount;
+        if (gEmergencyBlinkDoneCount >= gEmergencyBlinkTargetCount) {
+          gEmergencyBlinkState = EmergencyBlinkState::Idle;
+          gEmergencyBlinkStateMs = nowMs;
+          gEmergencyNextBlinkMs = nowMs + kEmergencyBlinkIntervalMs;
+        } else {
+          gEmergencyBlinkState = EmergencyBlinkState::BetweenSteps;
+          gEmergencyBlinkStateMs = nowMs;
+        }
+      }
+      break;
+
+    case EmergencyBlinkState::BetweenSteps:
+      if (nowMs - gEmergencyBlinkStateMs >= kEmergencyBlinkStepPauseMs) {
+        writeFlashLedRaw(true);
+        gEmergencyBlinkState = EmergencyBlinkState::On1;
+        gEmergencyBlinkStateMs = nowMs;
+      }
+      break;
+  }
+}
+
 camera_fb_t *captureFrameWithFlash() {
+  if (!gCameraReady) return nullptr;
   setFlashLed(true);
   delay(kFlashWarmupMs);
   camera_fb_t *fb = esp_camera_fb_get();
@@ -1484,7 +1878,7 @@ camera_fb_t *captureFrameWithFlash() {
 }
 
 bool setupCamera() {
-  camera_config_t config;
+  camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
   config.pin_d0 = Y2_GPIO_NUM;
@@ -1601,20 +1995,28 @@ void setup() {
 
   setupFlashLed();
 
-  if (!setupStorage()) {
-    Serial.println("[BOOT] Fatal: storage setup failed");
-    while (true) {
-      Serial.println("[BOOT] Waiting in fatal loop: storage");
-      delay(1000);
-    }
+  gStorageReady = setupStorage();
+  if (!gStorageReady) {
+    Serial.println("[BOOT] Warning: storage setup failed -> safe mode path active");
   }
 
-  if (!setupCamera()) {
-    Serial.println("[BOOT] Fatal: camera setup failed");
-    while (true) {
-      Serial.println("[BOOT] Waiting in fatal loop: camera");
-      delay(1000);
-    }
+  gCameraReady = setupCamera();
+  if (!gCameraReady) {
+    Serial.println("[BOOT] Warning: camera setup failed -> safe mode path active");
+  }
+
+  if (!gStorageReady || !gCameraReady) {
+    setEmergencyFault(
+      (!gStorageReady && !gCameraReady)
+        ? EmergencyFault::StorageAndCamera
+        : (!gStorageReady ? EmergencyFault::Storage : EmergencyFault::Camera)
+    );
+    setEmergencyMode(
+      true,
+      (!gStorageReady && !gCameraReady)
+        ? "storage+camera init failed"
+        : (!gStorageReady ? "storage init failed" : "camera init failed")
+    );
   }
 
   setupWiFi();
@@ -1630,6 +2032,11 @@ void setup() {
 }
 
 static void runPeriodicAnalysis() {
+  if (!gCameraReady || !gStorageReady) {
+    Serial.println("[CV] Periodic: safe mode active, skipping");
+    return;
+  }
+
   DeviceConfig config;
   if (!loadDeviceConfig(config)) {
     Serial.println("[CV] Periodic: calibration missing, skipping");
@@ -1686,6 +2093,7 @@ void loop() {
   handleModbusTcp();
 
   const uint32_t now = millis();
+  maintainEmergencyFlash(now);
   updateSystemRegisters(now);
   maintainWiFi(now);
 
