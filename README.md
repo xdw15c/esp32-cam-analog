@@ -1,224 +1,231 @@
-# ESP32-CAM Manometry
+﻿# ESP32-CAM Manometry
 
-## Cel projektu
+## Overview
 
-Zbudować urządzenie oparte o ESP32-CAM, które:
+This firmware runs on ESP32-CAM and reads two analog pressure gauges from an image.
+Results are exposed through:
 
-1. Odczytuje wskazania **dwóch manometrów analogowych** widocznych w kadrze kamery.
-2. Wyznacza wartości obu manometrów oraz różnicę `manometr_1 - manometr_2`.
-3. Udostępnia wyniki lokalnie przez panel WWW i Modbus TCP.
+- Web UI (HTTP)
+- Modbus TCP (FC03)
 
-## Projekty referencyjne (punkt wyjścia)
+## Current Project Status
 
-1. Artykuł Circuits Ninja:
-  - https://circuits-ninja.pl/odczyt-wskazania-z-analogowego-manometru-za-pomoca-modulu-esp32-cam-z-kamera-ov2640-i-opencv/
-  - Wykorzystujemy jako inspirację do podejścia opartego o analizę obrazu i mapowanie kąta wskazówki na wartość.
+The current version is stable and actively maintained.
+Implemented features:
 
-2. Repozytorium AI on the edge device:
-  - https://github.com/jomjol/AI-on-the-edge-device
-  - Traktujemy jako referencję architektury i doświadczeń praktycznych z odczytem analogowych liczników.
+- two-gauge analysis in a single frame
+- three analysis modes:
+  - `classic_darkness`
+  - `color_target`
+  - `hybrid_pca_hough`
+- ROI and gauge parameter calibration in Web UI
+- SD config storage: `/config/config.json`
+- SD system log: `/logs/system.log`
+- Web Logs tab (view + clear)
+- Modbus TCP with 16 holding registers
+- `fault_code` and `analysis_source` in Modbus
+- offline SD mode (`/latest.jpg`, camera init skipped)
+- JPEG upload from Web UI to `/latest.jpg`
+- analysis decision debug fields in JSON (reason for selected/rejected angle)
 
-## Decyzja projektowa
+## Image Source Modes
 
-- Projekt ma działać **w całości na ESP32-CAM**.
-- AI/ML **nie jest wymagane** w MVP.
-- Preferowane podejście: klasyczna analiza obrazu (CV), czyli wyznaczanie kąta wychylenia wskazówki i przeliczenie na jednostki ciśnienia po kalibracji.
-- Rozwiązania AI mogą być rozważone dopiero opcjonalnie, jeśli klasyczne CV okaże się niewystarczające.
+The firmware supports 3 practical image source scenarios:
 
-## Założenia funkcjonalne (MVP)
+1. Live camera mode
+- target production mode after camera hardware is repaired
 
-- Kamera obserwuje oba manometry w **stałym położeniu**.
-- Odczyt wykonywany cyklicznie.
-- Wyniki dostępne przez HTTP JSON i Modbus TCP.
-- W przypadku braku poprawnego odczytu publikowany jest status błędu.
+2. SD file mode (`/latest.jpg`)
+- active fallback/offline mode
+- does not require camera
 
-## Założenia techniczne
+3. Web upload mode
+- uploaded JPEG is saved as `/latest.jpg`
+- analysis then works like SD source mode
 
-- Platforma: **ESP32-CAM** (OV2640).
-- Firmware: C++ (PlatformIO / Arduino framework).
-- Komunikacja: Wi-Fi + HTTP + Modbus TCP.
-- Przetwarzanie obrazu na urządzeniu, bez konieczności serwera pośredniego.
-- Priorytet dla lekkich algorytmów CV możliwych do uruchomienia na ESP32-CAM (bez wymogu modeli AI).
+## HTTP API
 
-## Aktualny tryb pracy
+Main endpoints:
 
-Obecna wersja firmware ma dwa istotne tryby architektoniczne:
+- `GET /`
+- `POST /capture`
+- `POST /analyze`
+- `GET /photo.jpg`
+- `GET /config`
+- `POST /config`
+- `GET /modbus/status`
+- `GET /logs`
+- `POST /logs/clear`
+- `POST /upload`
 
-- normalny tryb kamery: analiza na żywej klatce z OV2640,
-- tymczasowy tryb offline z SD: analiza na istniejącym pliku `/latest.jpg` zapisanym na karcie SD.
-
-Na ten moment aktywny jest tryb offline z SD. Kamera nie jest inicjalizowana, a cała analityka działa na obrazie JPEG wczytanym z karty i dekodowanym do bufora RGB565.
-
-## Założenia dot. wizji komputerowej
-
-- Dla każdego manometru definiujemy osobny ROI (obszar obrazu).
-- Wskaźnik manometru wykrywany na podstawie kontrastu/krawędzi i geometrii wskazówki.
-- Kąt wskazówki mapowany na wartość ciśnienia wg kalibracji:
-  - `kat_min -> wartosc_min`,
-  - `kat_max -> wartosc_max`.
-- Dla każdego manometru osobna kalibracja (zakres, offset, orientacja).
-
-## Model danych MQTT (propozycja)
-
-Topic:
-
-- `esp-cam/manometry/readings`
-
-Payload JSON:
+## `/analyze` Response (short example)
 
 ```json
 {
-  "device_id": "esp32cam-01",
-  "ts": 1710000000,
-  "gauge_1": 3.42,
-  "gauge_2": 2.95,
-  "difference": 0.47,
-  "unit": "bar",
-  "status": "ok"
+  "status": "ok",
+  "source": "sd_photo",
+  "gauges": [
+    {
+      "id": 1,
+      "detected": true,
+      "angle_deg": 27.4,
+      "value": 3.42,
+      "confidence": 0.81,
+      "debug": {
+        "pointer_candidates": 2,
+        "selected_score": 96.1,
+        "opposite_score": 71.5,
+        "selected_reason": "selected_best_color_score"
+      }
+    }
+  ],
+  "debug": {
+    "detected_gauges": 2,
+    "pointer_candidates_total": 3
+  }
 }
 ```
 
-Statusy przykładowe:
+## Web UI
 
-- `ok`
-- `gauge_1_not_detected`
-- `gauge_2_not_detected`
-- `both_not_detected`
-- `calibration_missing`
+Tabs:
 
-## Konfiguracja (do przygotowania)
+- Camera
+- ROI Calibration
+- Modbus
+- Logs
 
-- Dane Wi-Fi (`ssid`, `password`).
-- MQTT (`host`, `port`, `user`, `password`, `topic`).
-- Konfiguracja manometrów:
-  - ROI 1 i ROI 2,
-  ## Model danych HTTP JSON (aktualny)
+The Modbus tab includes:
 
-  Endpoint:
+- raw register view
+- register map descriptions
+- decoded `status` / `fault_code` / `analysis_source`
 
-  - `POST /analyze`
+## Quick Start
 
-  Przykładowa odpowiedź:
-- Urządzenie łączy się z Wi-Fi.
-- Urządzenie publikuje dane do MQTT.
-- Dla statycznego testu dwóch manometrów odczyt obu wartości jest stabilny.
-- Różnica jest poprawnie liczona i publikowana.
-    "status": "ok",
-    "source": "sd_photo",
-    "frame": {
-      "width": 1024,
-      "height": 768
-    },
-    "processing_ms": 184,
-    "gauges": [
-      {
-        "id": 1,
-        "name": "Manometr 1",
-        "unit": "bar",
-        "analysis_mode": "color_target",
-        "detected": true,
-        "angle_deg": 27.4,
-        "value": 3.42,
-        "confidence": 0.81,
-        "darkness": 92.3
-      },
-      {
-        "id": 2,
-        "name": "Manometr 2",
-        "unit": "bar",
-        "analysis_mode": "color_target",
-        "detected": true,
-        "angle_deg": 15.9,
-        "value": 2.95,
-        "confidence": 0.77,
-        "darkness": 98.1
+1. Fill in `include/secrets.h`.
+2. Flash the firmware.
+3. Insert SD card and prepare `/latest.jpg` (or upload through Web UI).
+4. Open the Web UI and run analysis.
+
+## Notes
+
+- MQTT is not the primary integration path right now. Current operational integration is Web UI + Modbus TCP.
+- Modbus register map details: `README_MODBUS.md`
+- Next steps and open tasks: `ROADMAP.md`
+# ESP32-CAM Manometry
+
+## Co to jest
+
+Firmware dla ESP32-CAM, ktory odczytuje dwa manometry analogowe z obrazu i udostepnia wyniki przez:
+
+- panel WWW (HTTP)
+- Modbus TCP (FC03)
+
+## Aktualny stan projektu
+
+Wersja jest dzialajaca i utrzymywana.
+Najwazniejsze funkcje, ktore sa juz wdrozone:
+
+- analiza 2 manometrow w jednej klatce
+- 3 tryby analizy:
+  - classic_darkness
+  - color_target
+  - hybrid_pca_hough
+- kalibracja ROI i parametrow z poziomu WWW
+- zapis konfiguracji na SD: /config/config.json
+- log systemowy na SD: /logs/system.log
+- zakladka Logi w WWW (podglad + czyszczenie)
+- Modbus TCP z mapa 16 rejestrow
+- fault_code i analysis_source w Modbus
+- tryb offline SD (analiza z /latest.jpg, bez inicjalizacji kamery)
+- upload JPEG z WWW do /latest.jpg
+- debug decyzji analizy w JSON (powod wyboru/odrzucenia kata)
+
+## Tryby zrodla obrazu
+
+Firmware obsluguje 3 praktyczne scenariusze:
+
+1. Kamera live
+- docelowy tryb produkcyjny po naprawie hardware kamery
+
+2. Plik z SD (/latest.jpg)
+- aktywny tryb awaryjny/offline
+- kamera nie jest wymagana
+
+3. Upload z WWW
+- przeslany plik JPEG jest zapisywany jako /latest.jpg
+- dalsza analiza dziala jak dla zrodla SD
+
+## API HTTP
+
+Najwazniejsze endpointy:
+
+- GET /
+- POST /capture
+- POST /analyze
+- GET /photo.jpg
+- GET /config
+- POST /config
+- GET /modbus/status
+- GET /logs
+- POST /logs/clear
+- POST /upload
+
+## Odpowiedz /analyze (skrot)
+
+Przyklad (skrocony):
+
+```json
+{
+  "status": "ok",
+  "source": "sd_photo",
+  "gauges": [
+    {
+      "id": 1,
+      "detected": true,
+      "angle_deg": 27.4,
+      "value": 3.42,
+      "confidence": 0.81,
+      "debug": {
+        "pointer_candidates": 2,
+        "selected_score": 96.1,
+        "opposite_score": 71.5,
+        "selected_reason": "selected_best_color_score"
       }
-    ]
+    }
+  ],
+  "debug": {
+    "detected_gauges": 2,
+    "pointer_candidates_total": 3
   }
-  ```
+}
+```
 
-  Statusy przykładowe:
+## Panel WWW
 
-  - `ok`
-  - `gauge_1_not_detected`
-  - `gauge_2_not_detected`
-  - `both_not_detected`
-  - `calibration_missing_or_invalid`
+Zakladki:
 
-  ## Konfiguracja
+- Kamera
+- Kalibracja ROI
+- Modbus
+- Logi
 
-  - Dane Wi-Fi (`ssid`, `password`).
-  - Dane logowania do panelu WWW (`WEB_USERNAME`, `WEB_PASSWORD`).
-  - Konfiguracja manometrów:
-    - środek tarczy,
-    - promień,
-    - kąty min/max,
-    - zakres wartości,
-    - jednostka,
-    - tryb analizy,
-    - kolory dla trybu `color_target`.
-  - Interwał analizy.
+W zakladce Modbus jest teraz:
 
-  Konfiguracja robocza zapisywana jest na SD jako `config/config.json`.
+- podglad surowych rejestrow
+- opis mapy rejestrow
+- dekodowanie kodow status/fault/source
 
-  ## Panel WWW
+## Szybkie uruchomienie
 
-  Urządzenie udostępnia panel WWW z Basic Auth. Aktualnie dostępne są zakładki:
+1. Uzupelnij include/secrets.h.
+2. Wgraj firmware.
+3. Wloz SD i przygotuj /latest.jpg (lub uzyj uploadu z WWW).
+4. Wejdz na panel WWW i uruchom analize.
 
-  - `Kamera`: podgląd ostatniego zdjęcia z SD i ręczne uruchomienie analizy,
-  - `Kalibracja ROI`: edycja parametrów obu manometrów i zapis konfiguracji,
-  - `Modbus`: podgląd stanu i rejestrów Modbus TCP,
-  - `Logi`: podgląd końcówki pliku `logs/system.log` i czyszczenie logu.
+## Uwagi
 
-  W trybie offline przyciski związane z kamerą operują na zdjęciu już zapisanym na SD, a nie na nowo wykonanej klatce.
-
-  ## Modbus TCP
-
-  Urządzenie udostępnia serwer Modbus TCP na porcie `502`.
-
-  - Rejestry z wynikami zawierają dwa odczyty, różnicę, confidence, uptime, RSSI, heartbeat.
-  - Dodatkowo wystawiany jest `fault_code`, dzięki któremu system nadrzędny może zgłosić alarm kamery lub pamięci.
-  - Wystawiane jest również `analysis_source`, aby odróżnić analizę z kamery od analizy z pliku na SD.
-
-  Szczegóły mapy rejestrów są w pliku `README_MODBUS.md`.
-
-  ## Logi i diagnostyka
-
-  Firmware zapisuje log do pliku `logs/system.log` na karcie SD.
-
-  - Log obejmuje start urządzenia, aktywację trybu awaryjnego, zapis konfiguracji oraz start usług WWW.
-  - Ten sam log jest widoczny z poziomu zakładki `Logi`.
-  - W przypadku problemów z kamerą lub storage można jednocześnie diagnozować stan po wzorcu LED, logu WWW i rejestrach Modbus.
-
-  ## Status aktualny
-
-  Aktualnie działa stabilna baza funkcjonalna:
-
-  - Wi-Fi,
-  - panel WWW z Basic Auth,
-  - zapis i odczyt konfiguracji z SD,
-  - analiza dwóch manometrów w kilku trybach (`classic_darkness`, `color_target`, `hybrid_pca_hough`),
-  - cykliczna analiza obrazu,
-  - Modbus TCP,
-  - logowanie do pliku tekstowego na SD i podgląd logu przez WWW,
-  - tryb offline z analizą istniejącego zdjęcia z SD,
-  - sygnalizacja błędu kamery/storage przez status, log i fault code.
-
-  ## Ograniczenia i ryzyka
-
-  - Obecna wersja pracuje tymczasowo bez żywej kamery i bazuje na jednym zdjęciu z SD.
-  - Jakość analizy nadal zależy od jakości i rozdzielczości zdjęcia referencyjnego.
-  - ESP32-CAM ma ograniczone zasoby RAM/CPU, więc rozbudowa algorytmów musi pozostać oszczędna pamięciowo.
-  - Po przywróceniu sprawnej kamery trzeba będzie ponownie zweryfikować stabilność trybu live.
-
-  ## Szybkie uruchomienie
-
-  1. Uzupełnij dane w `include/secrets.h`.
-  2. Wgraj firmware na ESP32-CAM.
-  3. Włóż kartę SD z plikiem `/latest.jpg`.
-  4. Odczytaj adres IP z logu lub z routera.
-  5. Wejdź na panel WWW, zaloguj się i uruchom analizę.
-
-  ## Roadmap
-
-  Szczegółowy plan dalszych etapów znajduje się w pliku `ROADMAP.md`.
+- MQTT nie jest obecnie glowna sciezka integracji. Biezaca integracja operacyjna to WWW + Modbus TCP.
+- Szczegoly mapy rejestrow: README_MODBUS.md
+- Dalsze kroki: ROADMAP.md
