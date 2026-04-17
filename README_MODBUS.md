@@ -31,12 +31,20 @@ Przykłady poprawnych zapytań FC03 dla całej mapy (16 rejestrów):
 | 40008 (7) | `uptime_hi` | Uptime sekundy (high word) | `uint16` |
 | 40009 (8) | `wifi_rssi` | RSSI Wi-Fi dBm, signed | `int16` |
 | 40010 (9) | `heartbeat` | Licznik heartbeat (co ~10 s) | `uint16` |
-| 40011..40016 (10..15) | `reserved` | Rezerwa | `uint16` |
+| 40011 (10) | `fault_code` | Bitmask błędów: 1=storage, 2=camera | `uint16` |
+| 40012 (11) | `analysis_source` | 0=unavailable, 1=camera_live, 2=sd_photo | `uint16` |
+| 40013..40016 (12..15) | `reserved` | Rezerwa | `uint16` |
 
 ## Uwagi
 
 - Wartość `-32768` (`0x8000`) w rejestrach signed oznacza brak poprawnej detekcji.
 - `uptime_s` można złożyć jako:
   - `uptime = (uptime_hi << 16) | uptime_lo`
+- `fault_code` można traktować jako maskę alarmową dla systemu nadrzędnego.
+  - `0` = brak błędu krytycznego
+  - `1` = błąd storage / karta SD
+  - `2` = błąd kamery
+  - `3` = jednoczesny błąd storage i kamery
+- `analysis_source=2` oznacza tryb offline, w którym analiza działa na pliku `/latest.jpg` z karty SD.
 - Zapytania z innym Unit ID niż `1` są ignorowane (brak odpowiedzi).
 - Mapę można rozszerzać bez zmiany portu/protokołu.

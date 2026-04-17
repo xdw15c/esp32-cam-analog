@@ -30,6 +30,7 @@
 #define FLASH_LED_GPIO_NUM 4
 
 static const uint16_t kFlashWarmupMs = 70;
+static const bool kOfflineSdPhotoMode = true;
 static bool gFlashEnabled = true;
 static uint32_t gAnalysisIntervalMs = 60000;
 static const uint32_t kMinAnalysisIntervalMs = 10000;
@@ -69,6 +70,10 @@ static uint32_t gEmergencyNextBlinkMs = 0;
 
 static const char *kPhotoPath = "/latest.jpg";
 static const char *kConfigPath = "/config/config.json";
+static const char *kLogDir = "/logs";
+static const char *kLogPath = "/logs/system.log";
+static const size_t kWebLogTailBytes = 8192;
+static uint8_t gJpegWorkBuffer[3100];
 static const uint8_t kGaugeCount = 2;
 
 struct GaugeConfig {
@@ -115,6 +120,13 @@ uint16_t modbusHolding[kModbusRegCount] = {0};
 
 camera_fb_t *captureFrameWithFlash();
 
+struct AnalysisFrame {
+  camera_fb_t *fb = nullptr;
+  camera_fb_t ownedFb = {};
+  uint8_t *ownedPixels = nullptr;
+  uint8_t *ownedJpeg = nullptr;
+};
+
 enum ModbusRegister : uint16_t {
   REG_STATUS = 0,
   REG_G1_X100 = 1,
@@ -126,8 +138,8 @@ enum ModbusRegister : uint16_t {
   REG_UPTIME_HI = 7,
   REG_WIFI_RSSI = 8,
   REG_HEARTBEAT = 9,
-  REG_RESERVED10 = 10,
-  REG_RESERVED11 = 11,
+  REG_FAULT_CODE = 10,
+  REG_ANALYSIS_SOURCE = 11,
   REG_RESERVED12 = 12,
   REG_RESERVED13 = 13,
   REG_RESERVED14 = 14,
@@ -182,13 +194,14 @@ select,input[type=color]{width:100%;border:1px solid #cbd5e1;border-radius:6px;p
     <button class="active" onclick="tab('cam',this)">Kamera</button>
     <button onclick="tab('roi',this)">Kalibracja ROI</button>
     <button onclick="tab('modbus',this)">Modbus</button>
+    <button onclick="tab('logs',this)">Logi</button>
   </nav>
 </div>
 
 <div id="tab-cam" class="page active">
   <div class="card">
     <div class="row">
-      <button onclick="capture()">&#128247; Zrob zdjecie</button>
+      <button onclick="capture()">&#128247; Uzyj zdjecia z SD</button>
       <button class="grn" onclick="analyzeCapture()">&#129504; Analizuj obraz</button>
       <button class="sec" onclick="reloadCam()">&#8635; Odswiez</button>
     </div>
@@ -205,7 +218,7 @@ select,input[type=color]{width:100%;border:1px solid #cbd5e1;border-radius:6px;p
   <div class="card">
     <p class="hint">Kliknij przycisk trybu przy manometrze, a nastepnie kliknij na obrazie, by ustawic srodek wskazowki.</p>
     <div class="row">
-      <button onclick="captureAndSwitch()">&#128247; Zrob nowe zdjecie</button>
+      <button onclick="captureAndSwitch()">&#128247; Wczytaj zdjecie z SD</button>
       <button class="grn" onclick="saveConfig()">&#128190; Zapisz config na SD</button>
       <button class="sec" onclick="loadConfig()">&#128194; Wczytaj z SD</button>
     </div>
@@ -314,6 +327,17 @@ select,input[type=color]{width:100%;border:1px solid #cbd5e1;border-radius:6px;p
   </div>
 </div>
 
+<div id="tab-logs" class="page">
+  <div class="card">
+    <div class="row">
+      <button class="sec" onclick="loadLogs()">&#8635; Odswiez log</button>
+      <button onclick="clearLogs()">Wyczysc log</button>
+    </div>
+    <p class="hint">Pokazywane sa ostatnie wpisy z pliku /logs/system.log.</p>
+    <pre id="logs-pre">Ladowanie...</pre>
+  </div>
+</div>
+
 <script>
 const COLORS=['','#e11d48','#2563eb'];
 let mode=0;
@@ -332,6 +356,7 @@ function tab(id,btn){
   if(modbusTimer){clearInterval(modbusTimer);modbusTimer=null;}
   if(id==='roi'){loadRoiImg();updatePreview();}
   if(id==='modbus'){loadModbusStatus();modbusTimer=setInterval(loadModbusStatus,2000);}
+  if(id==='logs'){loadLogs();}
 }
 
 function loadCamImg(){
@@ -511,6 +536,27 @@ async function loadModbusStatus(){
   }
 }
 
+async function loadLogs(){
+  const out=document.getElementById('logs-pre');
+  out.textContent='Ladowanie...';
+  try{
+    const r=await fetch('/logs?t='+Date.now());
+    const text=await r.text();
+    if(!r.ok){out.textContent='Blad odczytu logu: '+(text||r.status);return;}
+    out.textContent=text&&text.length?text:'Brak wpisow logu';
+  }catch(e){
+    out.textContent='Blad: '+e;
+  }
+}
+
+async function clearLogs(){
+  if(!confirm('Na pewno wyczyscic log?'))return;
+  const r=await fetch('/logs/clear',{method:'POST'});
+  const text=await r.text();
+  if(!r.ok){alert('Blad kasowania logu: '+(text||r.status));return;}
+  loadLogs();
+}
+
 loadCamImg();
 loadConfig();
 onGaugeAnalysisModeChanged(1);
@@ -559,6 +605,64 @@ bool sdWriteText(const char *path, const String &text) {
 bool sdEnsureDir(const char *dir) {
   if (SD_MMC.exists(dir)) return true;
   return SD_MMC.mkdir(dir);
+}
+
+String sdReadTextTail(const char *path, size_t maxBytes) {
+  File f = SD_MMC.open(path, FILE_READ);
+  if (!f) return String();
+
+  const size_t fileSize = f.size();
+  size_t startOffset = 0;
+  if (maxBytes > 0 && fileSize > maxBytes) {
+    startOffset = fileSize - maxBytes;
+  }
+
+  if (startOffset > 0 && !f.seek(startOffset)) {
+    f.close();
+    return String();
+  }
+
+  // Start at a whole line when serving the tail.
+  if (startOffset > 0) {
+    while (f.available()) {
+      if (f.read() == '\n') break;
+    }
+  }
+
+  String text;
+  text.reserve(maxBytes > 0 ? maxBytes + 32 : fileSize + 1);
+  while (f.available()) {
+    text += static_cast<char>(f.read());
+  }
+  f.close();
+  return text;
+}
+
+bool appendLogLine(const String &line) {
+  if (!gStorageReady) return false;
+  if (!sdEnsureDir(kLogDir)) return false;
+
+  File f = SD_MMC.open(kLogPath, FILE_APPEND);
+  if (!f) return false;
+  const size_t written = f.println(line);
+  f.close();
+  return written > 0;
+}
+
+void logEvent(const char *level, const String &message) {
+  String line;
+  line.reserve(48 + message.length());
+  line += String(millis());
+  line += " [";
+  line += (level ? level : "INFO");
+  line += "] ";
+  line += message;
+  Serial.println(line);
+  appendLogLine(line);
+}
+
+void logEvent(const char *level, const char *message) {
+  logEvent(level, String(message ? message : ""));
 }
 
 String jsonEscape(const String &value) {
@@ -896,6 +1000,29 @@ void setRegisterU16(uint16_t index, uint16_t value) {
   modbusHolding[index] = value;
 }
 
+uint16_t currentFaultCode() {
+  uint16_t faultCode = 0;
+  if (!gStorageReady) faultCode |= 0x01;
+  if (!gCameraReady) faultCode |= 0x02;
+  return faultCode;
+}
+
+uint16_t currentAnalysisSourceCode() {
+  if (kOfflineSdPhotoMode) return 2;
+  return gCameraReady ? 1 : 0;
+}
+
+const char *currentAnalysisSourceName() {
+  switch (currentAnalysisSourceCode()) {
+    case 1:
+      return "camera_live";
+    case 2:
+      return "sd_photo";
+    default:
+      return "unavailable";
+  }
+}
+
 void updateSystemRegisters(uint32_t nowMs) {
   const uint32_t uptimeSeconds = nowMs / 1000;
   setRegisterU16(REG_UPTIME_LO, static_cast<uint16_t>(uptimeSeconds & 0xFFFF));
@@ -906,6 +1033,9 @@ void updateSystemRegisters(uint32_t nowMs) {
   } else {
     setRegisterS16(REG_WIFI_RSSI, -32768);
   }
+
+  setRegisterU16(REG_FAULT_CODE, currentFaultCode());
+  setRegisterU16(REG_ANALYSIS_SOURCE, currentAnalysisSourceCode());
 }
 
 void updateAnalysisRegisters(const GaugeReading readings[]) {
@@ -1406,6 +1536,7 @@ String buildAnalysisJson(const DeviceConfig &config, const GaugeReading readings
   String json = "{";
   json += "\"device_id\":\"" + jsonEscape(config.deviceId) + "\",";
   json += "\"status\":\"" + status + "\",";
+  json += "\"source\":\"" + String(currentAnalysisSourceName()) + "\",";
   json += "\"frame\":{\"width\":" + String(frameWidth) + ",\"height\":" + String(frameHeight) + "},";
   json += "\"processing_ms\":" + String(elapsedMs) + ',';
   json += "\"gauges\":[";
@@ -1432,7 +1563,157 @@ String buildAnalysisJson(const DeviceConfig &config, const GaugeReading readings
   return json;
 }
 
+bool loadAnalysisFrameFromSd(AnalysisFrame &frame, String &error) {
+  if (!gStorageReady) {
+    error = "storage_not_ready";
+    return false;
+  }
+  if (!SD_MMC.exists(kPhotoPath)) {
+    error = "photo_not_found";
+    return false;
+  }
+
+  File f = SD_MMC.open(kPhotoPath, FILE_READ);
+  if (!f) {
+    error = "photo_open_failed";
+    return false;
+  }
+
+  const size_t jpgLen = f.size();
+  if (jpgLen == 0) {
+    f.close();
+    error = "photo_empty";
+    return false;
+  }
+
+  uint8_t *jpgBuf = static_cast<uint8_t *>(ps_malloc(jpgLen));
+  if (!jpgBuf) {
+    f.close();
+    error = "jpg_alloc_failed";
+    return false;
+  }
+
+  const size_t bytesRead = f.read(jpgBuf, jpgLen);
+  f.close();
+  if (bytesRead != jpgLen) {
+    free(jpgBuf);
+    error = "photo_read_failed";
+    return false;
+  }
+
+  auto parseJpegDimensions = [](const uint8_t *data, size_t len, uint16_t &width, uint16_t &height) -> bool {
+    if (!data || len < 4 || data[0] != 0xFF || data[1] != 0xD8) return false;
+
+    size_t offset = 2;
+    while (offset + 1 < len) {
+      while (offset < len && data[offset] == 0xFF) {
+        ++offset;
+      }
+      if (offset >= len) return false;
+
+      const uint8_t marker = data[offset++];
+      if (marker == 0xD9 || marker == 0xDA) return false;
+      if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
+      if (offset + 1 >= len) return false;
+
+      const uint16_t segmentLen = static_cast<uint16_t>((data[offset] << 8) | data[offset + 1]);
+      offset += 2;
+      if (segmentLen < 2 || offset + segmentLen - 2 > len) return false;
+
+      const bool isSofMarker =
+        (marker >= 0xC0 && marker <= 0xC3) ||
+        (marker >= 0xC5 && marker <= 0xC7) ||
+        (marker >= 0xC9 && marker <= 0xCB) ||
+        (marker >= 0xCD && marker <= 0xCF);
+      if (isSofMarker) {
+        if (segmentLen < 7) return false;
+        height = static_cast<uint16_t>((data[offset + 1] << 8) | data[offset + 2]);
+        width = static_cast<uint16_t>((data[offset + 3] << 8) | data[offset + 4]);
+        return width > 0 && height > 0;
+      }
+
+      offset += segmentLen - 2;
+    }
+
+    return false;
+  };
+
+  uint16_t imageWidth = 0;
+  uint16_t imageHeight = 0;
+  if (!parseJpegDimensions(jpgBuf, jpgLen, imageWidth, imageHeight)) {
+    free(jpgBuf);
+    error = "photo_info_failed";
+    return false;
+  }
+
+  const size_t rgb565Len = static_cast<size_t>(imageWidth) * static_cast<size_t>(imageHeight) * 2;
+  uint8_t *rgbBuf = static_cast<uint8_t *>(ps_malloc(rgb565Len));
+  if (!rgbBuf) {
+    free(jpgBuf);
+    error = "rgb_alloc_failed";
+    return false;
+  }
+
+  if (!jpg2rgb565(jpgBuf, jpgLen, rgbBuf, JPG_SCALE_NONE)) {
+    free(rgbBuf);
+    free(jpgBuf);
+    error = "photo_decode_failed";
+    return false;
+  }
+
+  frame.ownedJpeg = jpgBuf;
+  frame.ownedPixels = rgbBuf;
+  frame.ownedFb.buf = rgbBuf;
+  frame.ownedFb.len = rgb565Len;
+  frame.ownedFb.width = imageWidth;
+  frame.ownedFb.height = imageHeight;
+  frame.ownedFb.format = PIXFORMAT_RGB565;
+  frame.fb = &frame.ownedFb;
+  return true;
+}
+
+bool loadAnalysisFrame(AnalysisFrame &frame, String &error) {
+  if (kOfflineSdPhotoMode) {
+    return loadAnalysisFrameFromSd(frame, error);
+  }
+
+  if (!gCameraReady) {
+    error = "camera_not_ready";
+    return false;
+  }
+
+  frame.fb = captureFrameWithFlash();
+  if (!frame.fb) {
+    error = "capture_failed";
+    return false;
+  }
+  return true;
+}
+
+void releaseAnalysisFrame(AnalysisFrame &frame) {
+  if (frame.fb == &frame.ownedFb) {
+    if (frame.ownedPixels) free(frame.ownedPixels);
+    if (frame.ownedJpeg) free(frame.ownedJpeg);
+  } else if (frame.fb) {
+    esp_camera_fb_return(frame.fb);
+  }
+  frame = AnalysisFrame();
+}
+
 bool captureAndSave() {
+  if (kOfflineSdPhotoMode) {
+    if (!gStorageReady) {
+      Serial.println("[SD] Storage not ready");
+      return false;
+    }
+    if (!SD_MMC.exists(kPhotoPath)) {
+      Serial.println("[SD] Offline source photo missing");
+      return false;
+    }
+    Serial.println("[SD] Offline source photo ready");
+    return true;
+  }
+
   if (!gCameraReady) {
     Serial.println("[CAM] Camera not ready");
     return false;
@@ -1468,7 +1749,7 @@ void handleRoot() {
 void handleCapture() {
   if (!checkAuth()) return;
   if (!captureAndSave()) {
-    server.send(500, "text/plain", "capture_failed");
+    server.send(kOfflineSdPhotoMode ? 404 : 500, "text/plain", kOfflineSdPhotoMode ? "photo_not_found" : "capture_failed");
     return;
   }
   server.send(200, "text/plain", "ok");
@@ -1476,11 +1757,6 @@ void handleCapture() {
 
 void handleAnalyze() {
   if (!checkAuth()) return;
-
-  if (!gCameraReady) {
-    server.send(503, "text/plain", "camera_not_ready");
-    return;
-  }
   if (!gStorageReady) {
     server.send(503, "text/plain", "storage_not_ready");
     return;
@@ -1494,14 +1770,17 @@ void handleAnalyze() {
   applyRuntimeSettings(config);
 
   const uint32_t start = millis();
-  camera_fb_t *fb = captureFrameWithFlash();
-  if (!fb) {
-    server.send(500, "text/plain", "capture_failed");
+  AnalysisFrame frame;
+  String frameError;
+  if (!loadAnalysisFrame(frame, frameError)) {
+    server.send(frameError == "storage_not_ready" ? 503 : 500, "text/plain", frameError);
     return;
   }
 
+  camera_fb_t *fb = frame.fb;
+
   if (fb->format != PIXFORMAT_RGB565) {
-    esp_camera_fb_return(fb);
+    releaseAnalysisFrame(frame);
     server.send(500, "text/plain", "unexpected_pixel_format");
     return;
   }
@@ -1514,17 +1793,17 @@ void handleAnalyze() {
 
   const int frameWidth = fb->width;
   const int frameHeight = fb->height;
-  const bool photoOk = saveFrameAsJpeg(fb, kPhotoPath);
+  const bool photoOk = kOfflineSdPhotoMode ? true : saveFrameAsJpeg(fb, kPhotoPath);
   const String response = buildAnalysisJson(config, readings, frameWidth, frameHeight, millis() - start);
-  esp_camera_fb_return(fb);
+  releaseAnalysisFrame(frame);
 
   if (!photoOk) {
     server.send(500, "text/plain", "photo_save_failed");
     return;
   }
 
-  Serial.printf("[CV] Analysis done in %u ms  frame=%dx%d\n",
-    static_cast<unsigned>(millis() - start), frameWidth, frameHeight);
+  Serial.printf("[CV] Analysis done in %u ms  source=%s  frame=%dx%d\n",
+    static_cast<unsigned>(millis() - start), currentAnalysisSourceName(), frameWidth, frameHeight);
   for (uint8_t i = 0; i < kGaugeCount; ++i) {
     const GaugeReading &r = readings[i];
     const GaugeConfig  &g = config.gauges[i];
@@ -1599,7 +1878,39 @@ void handleSaveConfig() {
   if (loadDeviceConfig(config)) {
     applyRuntimeSettings(config);
   }
-  Serial.println("[CFG] config.json saved");
+  logEvent("CFG", "config.json saved");
+  server.send(200, "text/plain", "ok");
+}
+
+void handleGetLogs() {
+  if (!checkAuth()) return;
+  if (!gStorageReady) {
+    server.send(503, "text/plain", "storage_not_ready");
+    return;
+  }
+
+  if (!SD_MMC.exists(kLogPath)) {
+    server.send(200, "text/plain; charset=utf-8", "Brak wpisow logu\n");
+    return;
+  }
+
+  const String logTail = sdReadTextTail(kLogPath, kWebLogTailBytes);
+  server.send(200, "text/plain; charset=utf-8", logTail.length() ? logTail : String("Brak wpisow logu\n"));
+}
+
+void handleClearLogs() {
+  if (!checkAuth()) return;
+  if (!gStorageReady) {
+    server.send(503, "text/plain", "storage_not_ready");
+    return;
+  }
+
+  if (SD_MMC.exists(kLogPath) && !SD_MMC.remove(kLogPath)) {
+    server.send(500, "text/plain", "clear_failed");
+    return;
+  }
+
+  logEvent("LOG", "Log cleared from web UI");
   server.send(200, "text/plain", "ok");
 }
 
@@ -1613,6 +1924,8 @@ String buildModbusStatusJson() {
   json += "\"wifi_status\":\"" + String(wifiOk ? "connected" : "disconnected") + "\",";
   json += "\"rssi_dbm\":" + String(static_cast<int16_t>(modbusHolding[REG_WIFI_RSSI])) + ',';
   json += "\"heartbeat\":" + String(modbusHolding[REG_HEARTBEAT]) + ',';
+  json += "\"fault_code\":" + String(modbusHolding[REG_FAULT_CODE]) + ',';
+  json += "\"analysis_source\":\"" + String(currentAnalysisSourceName()) + "\",";
   json += "\"registers\":[";
   for (uint16_t i = 0; i < kModbusRegCount; ++i) {
     if (i > 0) json += ',';
@@ -1754,7 +2067,7 @@ void setEmergencyMode(bool enabled, const char *reason) {
     gEmergencyBlinkStateMs = millis();
     gEmergencyNextBlinkMs = millis();
     gEmergencyBlinkDoneCount = 0;
-    Serial.printf("[SAFE] Emergency mode enabled: %s\n", reason ? reason : "unknown");
+    logEvent("SAFE", String("Emergency mode enabled: ") + (reason ? reason : "unknown"));
   } else {
     gEmergencyBlinkState = EmergencyBlinkState::Idle;
     gEmergencyBlinkStateMs = millis();
@@ -1762,7 +2075,7 @@ void setEmergencyMode(bool enabled, const char *reason) {
     gEmergencyFault = EmergencyFault::None;
     gEmergencyBlinkDoneCount = 0;
     gEmergencyBlinkTargetCount = 2;
-    Serial.println("[SAFE] Emergency mode disabled");
+    logEvent("SAFE", "Emergency mode disabled");
   }
 }
 
@@ -1878,6 +2191,11 @@ camera_fb_t *captureFrameWithFlash() {
 }
 
 bool setupCamera() {
+  if (kOfflineSdPhotoMode) {
+    logEvent("CAM", "Camera init skipped: offline SD photo analysis mode");
+    return false;
+  }
+
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -1983,8 +2301,10 @@ void setupWebServer() {
   server.on("/config", HTTP_GET, handleGetConfig);
   server.on("/config", HTTP_POST, handleSaveConfig);
   server.on("/modbus/status", HTTP_GET, handleGetModbusStatus);
+  server.on("/logs", HTTP_GET, handleGetLogs);
+  server.on("/logs/clear", HTTP_POST, handleClearLogs);
   server.begin();
-  Serial.println("[WEB]  Server started on port 80");
+  logEvent("WEB", "Server started on port 80");
 }
 
 void setup() {
@@ -1997,15 +2317,21 @@ void setup() {
 
   gStorageReady = setupStorage();
   if (!gStorageReady) {
-    Serial.println("[BOOT] Warning: storage setup failed -> safe mode path active");
+    logEvent("BOOT", "Warning: storage setup failed -> safe mode path active");
+  } else {
+    logEvent("BOOT", "Storage setup OK");
   }
 
   gCameraReady = setupCamera();
-  if (!gCameraReady) {
-    Serial.println("[BOOT] Warning: camera setup failed -> safe mode path active");
+  if (kOfflineSdPhotoMode) {
+    logEvent("BOOT", "Camera init skipped -> offline SD photo analysis mode");
+  } else if (!gCameraReady) {
+    logEvent("BOOT", "Warning: camera setup failed -> safe mode path active");
+  } else {
+    logEvent("BOOT", "Camera setup OK");
   }
 
-  if (!gStorageReady || !gCameraReady) {
+  if (!gStorageReady || (!gCameraReady && !kOfflineSdPhotoMode)) {
     setEmergencyFault(
       (!gStorageReady && !gCameraReady)
         ? EmergencyFault::StorageAndCamera
@@ -2028,12 +2354,15 @@ void setup() {
     applyRuntimeSettings(config);
   }
 
-  if (!captureAndSave()) Serial.println("[BOOT] Initial capture failed (continuing)");
+  if (!captureAndSave()) {
+    logEvent("BOOT", kOfflineSdPhotoMode ? "Offline source photo missing during startup" : "Initial capture failed (continuing)");
+  }
+  logEvent("BOOT", "Setup completed");
 }
 
 static void runPeriodicAnalysis() {
-  if (!gCameraReady || !gStorageReady) {
-    Serial.println("[CV] Periodic: safe mode active, skipping");
+  if (!gStorageReady) {
+    Serial.println("[CV] Periodic: storage not ready, skipping");
     return;
   }
 
@@ -2044,14 +2373,17 @@ static void runPeriodicAnalysis() {
   }
   applyRuntimeSettings(config);
 
-  camera_fb_t *fb = captureFrameWithFlash();
-  if (!fb) {
-    Serial.println("[CV] Periodic: capture failed");
+  AnalysisFrame frame;
+  String frameError;
+  if (!loadAnalysisFrame(frame, frameError)) {
+    Serial.printf("[CV] Periodic: source load failed: %s\n", frameError.c_str());
     return;
   }
 
+  camera_fb_t *fb = frame.fb;
+
   if (fb->format != PIXFORMAT_RGB565) {
-    esp_camera_fb_return(fb);
+    releaseAnalysisFrame(frame);
     Serial.println("[CV] Periodic: unexpected pixel format");
     return;
   }
@@ -2065,11 +2397,13 @@ static void runPeriodicAnalysis() {
 
   const int frameWidth = fb->width;
   const int frameHeight = fb->height;
-  saveFrameAsJpeg(fb, kPhotoPath);
+  if (!kOfflineSdPhotoMode) {
+    saveFrameAsJpeg(fb, kPhotoPath);
+  }
   const uint32_t elapsed = millis() - start;
-  esp_camera_fb_return(fb);
+  releaseAnalysisFrame(frame);
 
-  Serial.printf("[CV] Periodic done in %u ms  frame=%dx%d\n", elapsed, frameWidth, frameHeight);
+  Serial.printf("[CV] Periodic done in %u ms  source=%s  frame=%dx%d\n", elapsed, currentAnalysisSourceName(), frameWidth, frameHeight);
   for (uint8_t i = 0; i < kGaugeCount; ++i) {
     const GaugeReading &r = readings[i];
     const GaugeConfig  &g = config.gauges[i];

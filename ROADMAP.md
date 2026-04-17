@@ -1,8 +1,24 @@
 # Roadmap projektu
 
+## Stan bieżący
+
+Aktualna wersja firmware jest już po etapie uruchomienia podstawowego systemu i działa w trybie tymczasowym `offline SD photo mode`.
+
+To oznacza:
+
+- kamera jest logicznie pomijana przy starcie,
+- analiza obrazu bazuje na istniejącym pliku `/latest.jpg` z karty SD,
+- wyniki są wystawiane przez WWW i Modbus TCP,
+- log zdarzeń jest zapisywany do `logs/system.log` i udostępniany przez panel WWW,
+- `fault_code` w Modbus może wywołać alarm w systemie nadrzędnym.
+
+Najbliższy cel to dopracowanie analityki obrazu na zdjęciu referencyjnym, a dopiero później wrócenie do trybu live po naprawie hardware kamery.
+
 ## Kamienie milowe (plan programistyczny)
 
 ### M0 - Setup projektu
+
+Status: zakonczone
 
 Zakres:
 
@@ -17,18 +33,29 @@ Definition of Done:
 
 ### M1 - Kamera i akwizycja obrazu
 
+Status: czesciowo zakonczone
+
 Zakres:
 
 - Stabilny odczyt klatki z OV2640 (preferencyjnie grayscale/QVGA).
 - Kontrola ekspozycji/jasności pod stałe warunki stanowiska.
 - Endpoint diagnostyczny lub log do podglądu surowej klatki testowej.
 
-Definition of Done:
+Aktualizacja statusu:
+
+- podstawowa ścieżka kamery została uruchomiona i przetestowana,
+- obecnie etap jest czasowo zablokowany przez uszkodzenie kamery,
+- wprowadzono obejście w postaci analizy statycznego JPEG z SD.
+
+Definition of Done dla pełnego domknięcia etapu:
 
 - Minimum 100 kolejnych klatek bez restartu i bez błędów pamięci.
 - Czas pobrania klatki zmierzony i zapisany w logu.
+- Powrót z trybu offline do stabilnego trybu live.
 
 ### M2 - Kalibracja geometrii manometrów
+
+Status: w dużej części gotowe
 
 Zakres:
 
@@ -36,12 +63,19 @@ Zakres:
 - Ustalenie środka tarczy oraz zakresu kątów (`kat_min`, `kat_max`) dla obu manometrów.
 - Mapowanie kąt -> wartość (`wartosc_min`, `wartosc_max`) osobno dla każdego.
 
+Aktualizacja statusu:
+
+- parametry dwóch manometrów są zapisywane do `config/config.json`,
+- Web UI umożliwia ustawienie środka, promienia, zakresu kątów, zakresu wartości i parametrów analizy.
+
 Definition of Done:
 
 - Parametry kalibracji są zapisane i wczytywane po restarcie.
 - Dla klatek testowych algorytm zwraca sensowny kąt dla obu ROI.
 
 ### M3 - Odczyt jednego manometru (algorytm bazowy)
+
+Status: w toku
 
 Zakres:
 
@@ -56,11 +90,18 @@ Definition of Done:
 
 ### M4 - Dwa manometry i różnica
 
+Status: bazowo zaimplementowane
+
 Zakres:
 
 - Uruchomienie algorytmu dla dwóch ROI w tej samej klatce.
 - Obliczanie `difference = gauge_1 - gauge_2`.
 - Obsługa statusów błędów dla braków detekcji pojedynczej i podwójnej.
+
+Aktualizacja statusu:
+
+- obie wartości i różnica są liczone w jednym przebiegu analizy,
+- dostępne są statusy `ok`, `gauge_1_not_detected`, `gauge_2_not_detected`, `both_not_detected`.
 
 Definition of Done:
 
@@ -69,11 +110,19 @@ Definition of Done:
 
 ### M5 - Integracja MQTT i telemetria
 
-Zakres:
+Status: odlozone / zmienione
+
+Zakres pierwotny:
 
 - Publikacja JSON z odczytami, różnicą, statusem i timestamp.
 - Konfigurowalny interwał publikacji.
 - Reconnect Wi-Fi/MQTT i odporność na chwilowy brak sieci.
+
+Aktualizacja statusu:
+
+- zamiast MQTT wdrożono lokalne WWW i Modbus TCP,
+- heartbeat, RSSI, fault code i source są już wystawiane do systemu nadrzędnego,
+- ewentualny MQTT pozostaje opcjonalnym rozszerzeniem, nie blokuje obecnego celu.
 
 Definition of Done:
 
@@ -81,6 +130,8 @@ Definition of Done:
 - Po zerwaniu sieci urządzenie samo wraca do publikacji.
 
 ### M6 - Testy środowiskowe i strojenie
+
+Status: aktywne teraz
 
 Zakres:
 
@@ -104,9 +155,12 @@ Bierzemy z niego konkretne wzorce:
 
 ## Backlog techniczny po MVP
 
+- Powrót do trybu live po naprawie hardware kamery.
+- Dodanie jawnego badge `offline / SD mode` w UI.
+- Rozszerzenie logów o reason resetu i numer kolejnego bootu.
 - Autokalibracja ROI (opcjonalnie półautomatyczna).
 - Lepsza detekcja refleksów i odblasków.
-- Zdalna rekonfiguracja parametrów przez MQTT.
+- Zdalna rekonfiguracja parametrów przez MQTT lub HTTP API.
 - Buforowanie odczytów przy braku sieci.
 - OTA update firmware przez Web UI.
 

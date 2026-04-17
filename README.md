@@ -1,14 +1,12 @@
-# ESP32-CAM Manometry -> MQTT
+# ESP32-CAM Manometry
 
 ## Cel projektu
 
 Zbudować urządzenie oparte o ESP32-CAM, które:
 
 1. Odczytuje wskazania **dwóch manometrów analogowych** widocznych w kadrze kamery.
-2. Wyznacza i publikuje przez MQTT:
-   - wartość manometru 1,
-   - wartość manometru 2,
-   - różnicę: `manometr_1 - manometr_2`.
+2. Wyznacza wartości obu manometrów oraz różnicę `manometr_1 - manometr_2`.
+3. Udostępnia wyniki lokalnie przez panel WWW i Modbus TCP.
 
 ## Projekty referencyjne (punkt wyjścia)
 
@@ -30,17 +28,26 @@ Zbudować urządzenie oparte o ESP32-CAM, które:
 ## Założenia funkcjonalne (MVP)
 
 - Kamera obserwuje oba manometry w **stałym położeniu**.
-- Odczyt wykonywany cyklicznie (np. co 1-5 s, wartość do ustalenia).
-- Wyniki wysyłane przez MQTT w postaci JSON.
+- Odczyt wykonywany cyklicznie.
+- Wyniki dostępne przez HTTP JSON i Modbus TCP.
 - W przypadku braku poprawnego odczytu publikowany jest status błędu.
 
 ## Założenia techniczne
 
 - Platforma: **ESP32-CAM** (OV2640).
 - Firmware: C++ (PlatformIO / Arduino framework).
-- Komunikacja: Wi-Fi + MQTT (broker lokalny lub chmurowy).
+- Komunikacja: Wi-Fi + HTTP + Modbus TCP.
 - Przetwarzanie obrazu na urządzeniu, bez konieczności serwera pośredniego.
 - Priorytet dla lekkich algorytmów CV możliwych do uruchomienia na ESP32-CAM (bez wymogu modeli AI).
+
+## Aktualny tryb pracy
+
+Obecna wersja firmware ma dwa istotne tryby architektoniczne:
+
+- normalny tryb kamery: analiza na żywej klatce z OV2640,
+- tymczasowy tryb offline z SD: analiza na istniejącym pliku `/latest.jpg` zapisanym na karcie SD.
+
+Na ten moment aktywny jest tryb offline z SD. Kamera nie jest inicjalizowana, a cała analityka działa na obrazie JPEG wczytanym z karty i dekodowanym do bufora RGB565.
 
 ## Założenia dot. wizji komputerowej
 
@@ -85,52 +92,133 @@ Statusy przykładowe:
 - MQTT (`host`, `port`, `user`, `password`, `topic`).
 - Konfiguracja manometrów:
   - ROI 1 i ROI 2,
-  - zakresy wartości,
-  - kąty min/max,
-  - jednostka (np. bar).
-- Interwał publikacji.
+  ## Model danych HTTP JSON (aktualny)
 
-## Kryteria akceptacji etapu 1
+  Endpoint:
 
+  - `POST /analyze`
+
+  Przykładowa odpowiedź:
 - Urządzenie łączy się z Wi-Fi.
 - Urządzenie publikuje dane do MQTT.
 - Dla statycznego testu dwóch manometrów odczyt obu wartości jest stabilny.
 - Różnica jest poprawnie liczona i publikowana.
+    "status": "ok",
+    "source": "sd_photo",
+    "frame": {
+      "width": 1024,
+      "height": 768
+    },
+    "processing_ms": 184,
+    "gauges": [
+      {
+        "id": 1,
+        "name": "Manometr 1",
+        "unit": "bar",
+        "analysis_mode": "color_target",
+        "detected": true,
+        "angle_deg": 27.4,
+        "value": 3.42,
+        "confidence": 0.81,
+        "darkness": 92.3
+      },
+      {
+        "id": 2,
+        "name": "Manometr 2",
+        "unit": "bar",
+        "analysis_mode": "color_target",
+        "detected": true,
+        "angle_deg": 15.9,
+        "value": 2.95,
+        "confidence": 0.77,
+        "darkness": 98.1
+      }
+    ]
+  }
+  ```
 
-## Ograniczenia i ryzyka
+  Statusy przykładowe:
 
-- Zmienna ekspozycja/odbicia światła mogą pogarszać detekcję wskazówki.
-- Drgania kamery lub przesunięcie manometrów wymagają ponownej kalibracji.
-- ESP32-CAM ma ograniczone zasoby RAM/CPU, co ogranicza złożoność algorytmów.
+  - `ok`
+  - `gauge_1_not_detected`
+  - `gauge_2_not_detected`
+  - `both_not_detected`
+  - `calibration_missing_or_invalid`
 
-## Roadmap
+  ## Konfiguracja
 
-Szczegółowy plan etapów, backlog oraz sposób śledzenia postępu znajduje się w pliku `ROADMAP.md`.
+  - Dane Wi-Fi (`ssid`, `password`).
+  - Dane logowania do panelu WWW (`WEB_USERNAME`, `WEB_PASSWORD`).
+  - Konfiguracja manometrów:
+    - środek tarczy,
+    - promień,
+    - kąty min/max,
+    - zakres wartości,
+    - jednostka,
+    - tryb analizy,
+    - kolory dla trybu `color_target`.
+  - Interwał analizy.
 
-## Status MVP v0 (zaimplementowane)
+  Konfiguracja robocza zapisywana jest na SD jako `config/config.json`.
 
-Aktualnie działa prosta wersja startowa:
+  ## Panel WWW
 
-- ESP32-CAM wykonuje zdjęcie i zapisuje je na karcie SD jako `/latest.jpg`.
-- Urządzenie udostępnia panel WWW z Basic Auth.
-- W panelu można:
-  - wykonać nowe zdjęcie,
-  - wyświetlić ostatnie zdjęcie,
-  - klikać punkty (oznaczenia) na obrazie,
-  - zapisać punkty na SD jako `/markers.json`,
-  - wczytać zapisane punkty.
+  Urządzenie udostępnia panel WWW z Basic Auth. Aktualnie dostępne są zakładki:
 
-Pliki implementacji:
+  - `Kamera`: podgląd ostatniego zdjęcia z SD i ręczne uruchomienie analizy,
+  - `Kalibracja ROI`: edycja parametrów obu manometrów i zapis konfiguracji,
+  - `Modbus`: podgląd stanu i rejestrów Modbus TCP,
+  - `Logi`: podgląd końcówki pliku `logs/system.log` i czyszczenie logu.
 
-- `src/main.cpp`
-- `include/secrets.h`
-- `include/secrets.h.example`
-- `platformio.ini`
+  W trybie offline przyciski związane z kamerą operują na zdjęciu już zapisanym na SD, a nie na nowo wykonanej klatce.
 
-## Szybkie uruchomienie
+  ## Modbus TCP
 
-1. Uzupełnij dane w `include/secrets.h` (Wi-Fi oraz login/hasło do panelu WWW).
-2. Wgraj firmware na ESP32-CAM (`pio run -t upload`).
-3. Otwórz monitor portu szeregowego (`pio device monitor`) i odczytaj adres IP.
-4. Wejdź w przeglądarce na adres ESP32 i zaloguj się.
-5. Kliknij "Zrob nowe zdjecie" i oznacz punkty na obrazie.
+  Urządzenie udostępnia serwer Modbus TCP na porcie `502`.
+
+  - Rejestry z wynikami zawierają dwa odczyty, różnicę, confidence, uptime, RSSI, heartbeat.
+  - Dodatkowo wystawiany jest `fault_code`, dzięki któremu system nadrzędny może zgłosić alarm kamery lub pamięci.
+  - Wystawiane jest również `analysis_source`, aby odróżnić analizę z kamery od analizy z pliku na SD.
+
+  Szczegóły mapy rejestrów są w pliku `README_MODBUS.md`.
+
+  ## Logi i diagnostyka
+
+  Firmware zapisuje log do pliku `logs/system.log` na karcie SD.
+
+  - Log obejmuje start urządzenia, aktywację trybu awaryjnego, zapis konfiguracji oraz start usług WWW.
+  - Ten sam log jest widoczny z poziomu zakładki `Logi`.
+  - W przypadku problemów z kamerą lub storage można jednocześnie diagnozować stan po wzorcu LED, logu WWW i rejestrach Modbus.
+
+  ## Status aktualny
+
+  Aktualnie działa stabilna baza funkcjonalna:
+
+  - Wi-Fi,
+  - panel WWW z Basic Auth,
+  - zapis i odczyt konfiguracji z SD,
+  - analiza dwóch manometrów w kilku trybach (`classic_darkness`, `color_target`, `hybrid_pca_hough`),
+  - cykliczna analiza obrazu,
+  - Modbus TCP,
+  - logowanie do pliku tekstowego na SD i podgląd logu przez WWW,
+  - tryb offline z analizą istniejącego zdjęcia z SD,
+  - sygnalizacja błędu kamery/storage przez status, log i fault code.
+
+  ## Ograniczenia i ryzyka
+
+  - Obecna wersja pracuje tymczasowo bez żywej kamery i bazuje na jednym zdjęciu z SD.
+  - Jakość analizy nadal zależy od jakości i rozdzielczości zdjęcia referencyjnego.
+  - ESP32-CAM ma ograniczone zasoby RAM/CPU, więc rozbudowa algorytmów musi pozostać oszczędna pamięciowo.
+  - Po przywróceniu sprawnej kamery trzeba będzie ponownie zweryfikować stabilność trybu live.
+
+  ## Szybkie uruchomienie
+
+  1. Uzupełnij dane w `include/secrets.h`.
+  2. Wgraj firmware na ESP32-CAM.
+  3. Włóż kartę SD z plikiem `/latest.jpg`.
+  4. Odczytaj adres IP z logu lub z routera.
+  5. Wejdź na panel WWW, zaloguj się i uruchom analizę.
+
+  ## Roadmap
+
+  Szczegółowy plan dalszych etapów znajduje się w pliku `ROADMAP.md`.
