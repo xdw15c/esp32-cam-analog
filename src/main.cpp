@@ -75,6 +75,8 @@ static const char *kLogPath = "/logs/system.log";
 static const size_t kWebLogTailBytes = 8192;
 static uint8_t gJpegWorkBuffer[3100];
 static const uint8_t kGaugeCount = 2;
+static File gUploadFile;
+static const float kAngleSearchMarginDeg = 8.0f;
 
 struct GaugeConfig {
   int id = 0;
@@ -110,6 +112,22 @@ struct GaugeReading {
   float darkness = 255.0f;
 };
 
+struct GaugeAnalysisDebug {
+  bool enabled = false;
+  float searchStartDeg = 0.0f;
+  float searchEndDeg = 0.0f;
+  int scannedAngles = 0;
+  int pointerCandidates = 0;
+  float selectedAngleDeg = 0.0f;
+  float selectedScore = 0.0f;
+  float selectedTipReach = 0.0f;
+  float oppositeAngleDeg = 0.0f;
+  float oppositeScore = 0.0f;
+  float oppositeTipReach = 0.0f;
+  bool oppositeDominates = false;
+  String selectedReason;
+};
+
 WebServer server(80);
 WiFiServer modbusServer(502);
 WiFiClient modbusClient;
@@ -117,6 +135,22 @@ static const uint8_t kModbusUnitId = 1;
 
 static const uint16_t kModbusRegCount = 16;
 uint16_t modbusHolding[kModbusRegCount] = {0};
+GaugeAnalysisDebug gLastGaugeDebug[kGaugeCount];
+
+GaugeAnalysisDebug *debugForGauge(const GaugeConfig &gauge) {
+  if (gauge.id < 1 || gauge.id > static_cast<int>(kGaugeCount)) return nullptr;
+  return &gLastGaugeDebug[gauge.id - 1];
+}
+
+void resetGaugeDebug(const GaugeConfig &gauge, float rangeStartDeg, float rangeEndDeg, int scannedAngles) {
+  GaugeAnalysisDebug *dbg = debugForGauge(gauge);
+  if (!dbg) return;
+  *dbg = GaugeAnalysisDebug();
+  dbg->enabled = true;
+  dbg->searchStartDeg = rangeStartDeg;
+  dbg->searchEndDeg = rangeEndDeg;
+  dbg->scannedAngles = scannedAngles;
+}
 
 camera_fb_t *captureFrameWithFlash();
 
@@ -204,6 +238,8 @@ select,input[type=color]{width:100%;border:1px solid #cbd5e1;border-radius:6px;p
       <button onclick="capture()">&#128247; Uzyj zdjecia z SD</button>
       <button class="grn" onclick="analyzeCapture()">&#129504; Analizuj obraz</button>
       <button class="sec" onclick="reloadCam()">&#8635; Odswiez</button>
+      <input type="file" id="upload-input" accept=".jpg,.jpeg,image/jpeg" style="display:none" onchange="uploadPhoto(this)">
+      <button class="sec" onclick="document.getElementById('upload-input').click()">&#128228; Upload zdjecia</button>
     </div>
     <canvas id="canvas"></canvas>
     <p id="img-info" class="imginfo"></p>
@@ -324,6 +360,8 @@ select,input[type=color]{width:100%;border:1px solid #cbd5e1;border-radius:6px;p
     <pre id="modbus-state">Ladowanie...</pre>
     <h3 style="margin:1rem 0 .5rem">Rejestry holding (0..15)</h3>
     <pre id="modbus-regs">Ladowanie...</pre>
+    <h3 style="margin:1rem 0 .5rem">Opis rejestrow i kody</h3>
+    <pre id="modbus-help">Ladowanie...</pre>
   </div>
 </div>
 
@@ -385,6 +423,18 @@ async function captureAndSwitch(){
   const r=await fetch('/capture',{method:'POST'});
   if(!r.ok){alert('Blad capture');return;}
   loadRoiImg();
+}
+
+async function uploadPhoto(input){
+  if(!input.files||!input.files[0])return;
+  const info=document.getElementById('img-info');
+  info.textContent='Wysylanie...';
+  const fd=new FormData();
+  fd.append('photo',input.files[0],'photo.jpg');
+  const r=await fetch('/upload',{method:'POST',body:fd});
+  input.value='';
+  if(!r.ok){info.textContent='Blad uploadu: '+(await r.text());return;}
+  loadCamImg();
 }
 
 async function analyzeCapture(){
@@ -511,28 +561,108 @@ async function loadConfig(){
 
 function renderModbusRegisters(registers){
   if(!Array.isArray(registers)||!registers.length)return 'Brak danych';
+  const descByAddr={
+    0:'status',
+    1:'g1_x100',
+    2:'g2_x100',
+    3:'diff_x100',
+    4:'conf1_x1000',
+    5:'conf2_x1000',
+    6:'uptime_lo',
+    7:'uptime_hi',
+    8:'wifi_rssi',
+    9:'heartbeat',
+    10:'fault_code',
+    11:'analysis_source',
+    12:'reserved12',
+    13:'reserved13',
+    14:'reserved14',
+    15:'reserved15'
+  };
   return registers.map(r=>{
-    return 'addr '+r.addr+' (4'+String(1+r.addr).padStart(4,'0')+')  u16='+r.u16+'  i16='+r.i16+'  hex='+r.hex;
+    const name=descByAddr[r.addr]||'unknown';
+    return 'addr '+r.addr+' (4'+String(1+r.addr).padStart(4,'0')+')  '+name+'  u16='+r.u16+'  i16='+r.i16+'  hex='+r.hex;
   }).join('\n');
+}
+
+function decodeStatusCode(code){
+  if(code===0)return 'ok';
+  if(code===11)return 'gauge_1_not_detected';
+  if(code===12)return 'gauge_2_not_detected';
+  if(code===13)return 'both_not_detected';
+  return 'unknown';
+}
+
+function decodeFaultCode(code){
+  if(code===0)return '0: brak bledow';
+  const parts=[];
+  if(code&0x01)parts.push('bit0=storage_not_ready');
+  if(code&0x02)parts.push('bit1=camera_not_ready');
+  return code+': '+(parts.length?parts.join(', '):'nieznany kod');
+}
+
+function decodeAnalysisSource(code){
+  if(code===0)return '0: unavailable';
+  if(code===1)return '1: camera_live';
+  if(code===2)return '2: sd_photo';
+  return code+': unknown';
+}
+
+function renderModbusHelp(data){
+  const regs=Array.isArray(data&&data.registers)?data.registers:[];
+  const byAddr={};
+  regs.forEach(r=>{byAddr[r.addr]=r;});
+  const u16=addr=>byAddr[addr]?byAddr[addr].u16:0;
+  const i16=addr=>byAddr[addr]?byAddr[addr].i16:0;
+
+  const lines=[];
+  lines.push('Mapa rejestrow (holding 4xxxx):');
+  lines.push('40001 addr0  status        : '+u16(0)+' -> '+decodeStatusCode(u16(0)));
+  lines.push('40002 addr1  g1_x100       : '+i16(1)+' (wartosc M1 * 100)');
+  lines.push('40003 addr2  g2_x100       : '+i16(2)+' (wartosc M2 * 100)');
+  lines.push('40004 addr3  diff_x100     : '+i16(3)+' (M1-M2)*100');
+  lines.push('40005 addr4  conf1_x1000   : '+u16(4)+' (pewnosc M1 0..1000)');
+  lines.push('40006 addr5  conf2_x1000   : '+u16(5)+' (pewnosc M2 0..1000)');
+  lines.push('40007 addr6  uptime_lo     : '+u16(6)+' (sekundy low word)');
+  lines.push('40008 addr7  uptime_hi     : '+u16(7)+' (sekundy high word)');
+  lines.push('40009 addr8  wifi_rssi     : '+i16(8)+' dBm');
+  lines.push('40010 addr9  heartbeat     : '+u16(9)+' (licznik zycia)');
+  lines.push('40011 addr10 fault_code    : '+decodeFaultCode(u16(10)));
+  lines.push('40012 addr11 analysis_src  : '+decodeAnalysisSource(u16(11)));
+  lines.push('40013 addr12 reserved12    : '+u16(12));
+  lines.push('40014 addr13 reserved13    : '+u16(13));
+  lines.push('40015 addr14 reserved14    : '+u16(14));
+  lines.push('40016 addr15 reserved15    : '+u16(15));
+  lines.push('');
+  lines.push('Kody specjalne:');
+  lines.push('status: 0=ok, 11=brak M1, 12=brak M2, 13=brak obu');
+  lines.push('fault_code bitmask: bit0=storage, bit1=camera');
+  lines.push('analysis_source: 0=unavailable, 1=camera_live, 2=sd_photo');
+  lines.push('Brak pomiaru w rejestrach i16: -32768');
+  return lines.join('\n');
 }
 
 async function loadModbusStatus(){
   const conn=document.getElementById('modbus-conn');
   const state=document.getElementById('modbus-state');
   const regs=document.getElementById('modbus-regs');
+  const help=document.getElementById('modbus-help');
   try{
     const r=await fetch('/modbus/status');
     if(!r.ok){
       const t=await r.text();
       conn.textContent='Blad odczytu: '+(t||r.status);
+      if(help)help.textContent='Brak danych';
       return;
     }
     const data=await r.json();
     conn.textContent='IP: '+data.ip+'\nPort: '+data.port+'\nUnit ID: '+data.unit_id+'\nFunkcja: '+data.function;
-    state.textContent='WiFi: '+data.wifi_status+'\nRSSI: '+data.rssi_dbm+' dBm\nHeartbeat: '+data.heartbeat;
+    state.textContent='WiFi: '+data.wifi_status+'\nRSSI: '+data.rssi_dbm+' dBm\nHeartbeat: '+data.heartbeat+'\nStatus: '+decodeStatusCode((data.registers&&data.registers[0])?data.registers[0].u16:0)+'\nFault: '+decodeFaultCode(data.fault_code||0)+'\nSource: '+decodeAnalysisSource((data.registers&&data.registers[11])?data.registers[11].u16:0);
     regs.textContent=renderModbusRegisters(data.registers);
+    if(help)help.textContent=renderModbusHelp(data);
   }catch(e){
     conn.textContent='Blad: '+e;
+    if(help)help.textContent='Blad: '+e;
   }
 }
 
@@ -1065,6 +1195,7 @@ float angleToValue(float angleDeg, const GaugeConfig &gauge) {
 struct AngleScore {
   float redStrength = 0.0f;
   float grayLevel = 255.0f;
+  float tipReach = 0.0f;
 };
 
 struct AnalysisColorProfile {
@@ -1108,10 +1239,23 @@ float angleDistanceDeg(float a, float b) {
   return fabsf(normalizeAngle180(a - b));
 }
 
+float radialPriority(float radius, float startRadius, float endRadius) {
+  const float span = max(1.0f, endRadius - startRadius);
+  const float norm = clamp01((radius - startRadius) / span);
+  const float normSq = norm * norm;
+  // Strongly reduce influence near axle to avoid selecting short counterweight arm.
+  return 0.15f + (0.85f * normSq);
+}
+
 bool angleWithinGaugeRange(float angleDeg, const GaugeConfig &gauge) {
-  const float start = min(gauge.angleMin, gauge.angleMax);
-  const float end = max(gauge.angleMin, gauge.angleMax);
+  const float start = min(gauge.angleMin, gauge.angleMax) - kAngleSearchMarginDeg;
+  const float end = max(gauge.angleMin, gauge.angleMax) + kAngleSearchMarginDeg;
   return angleDeg >= start && angleDeg <= end;
+}
+
+void expandedGaugeRange(const GaugeConfig &gauge, float &start, float &end) {
+  start = min(gauge.angleMin, gauge.angleMax) - kAngleSearchMarginDeg;
+  end = max(gauge.angleMin, gauge.angleMax) + kAngleSearchMarginDeg;
 }
 
 struct HybridLineScore {
@@ -1119,6 +1263,8 @@ struct HybridLineScore {
   float grayLevel = 255.0f;
   uint16_t hits = 0;
   uint16_t samples = 0;
+  float weightedHitRatio = 0.0f;
+  float tipReach = 0.0f;
 };
 
 HybridLineScore scoreNeedleLineHybrid(const camera_fb_t *fb, const GaugeConfig &gauge, float angleDeg, uint8_t darkThreshold) {
@@ -1133,8 +1279,12 @@ HybridLineScore scoreNeedleLineHybrid(const camera_fb_t *fb, const GaugeConfig &
   const float step = max(1.0f, gauge.radius / 34.0f);
 
   uint32_t graySum = 0;
+  float weightedHits = 0.0f;
+  float weightedSamples = 0.0f;
+  float maxHitRadius = 0.0f;
   uint16_t iter = 0;
   for (float radius = startRadius; radius <= endRadius; radius += step) {
+    const float radiusWeight = radialPriority(radius, startRadius, endRadius);
     for (int offset = -1; offset <= 1; ++offset) {
       const int x = lroundf(gauge.cx + dirX * radius + perpX * offset);
       const int y = lroundf(gauge.cy + dirY * radius + perpY * offset);
@@ -1142,7 +1292,12 @@ HybridLineScore scoreNeedleLineHybrid(const camera_fb_t *fb, const GaugeConfig &
       if (!sampleGray(fb, x, y, gray)) continue;
       graySum += gray;
       ++result.samples;
-      if (gray <= darkThreshold) ++result.hits;
+      weightedSamples += radiusWeight;
+      if (gray <= darkThreshold) {
+        ++result.hits;
+        weightedHits += radiusWeight;
+        if (radius > maxHitRadius) maxHitRadius = radius;
+      }
       ++iter;
       if ((iter % 220) == 0) {
         delay(0);
@@ -1154,14 +1309,27 @@ HybridLineScore scoreNeedleLineHybrid(const camera_fb_t *fb, const GaugeConfig &
 
   result.grayLevel = static_cast<float>(graySum) / result.samples;
   const float hitRatio = static_cast<float>(result.hits) / result.samples;
+  result.weightedHitRatio = (weightedSamples > 0.0f) ? (weightedHits / weightedSamples) : 0.0f;
+  result.tipReach = clamp01((maxHitRadius - startRadius) / max(1.0f, endRadius - startRadius));
   const float darknessBoost = max(0.0f, static_cast<float>(darkThreshold) - result.grayLevel);
-  result.score = (result.hits * 1.25f) + (hitRatio * 100.0f) + (darknessBoost * 0.16f);
+  result.score =
+    (result.hits * 1.00f) +
+    (hitRatio * 40.0f) +
+    (result.weightedHitRatio * 95.0f) +
+    (result.tipReach * 120.0f) +
+    (darknessBoost * 0.14f);
   return result;
 }
 
 GaugeReading analyzeGaugeHybrid(const camera_fb_t *fb, const GaugeConfig &gauge) {
   GaugeReading reading;
   if (!gauge.valid || !fb || fb->format != PIXFORMAT_RGB565) return reading;
+
+  float rangeStart = 0.0f;
+  float rangeEnd = 0.0f;
+  expandedGaugeRange(gauge, rangeStart, rangeEnd);
+  resetGaugeDebug(gauge, rangeStart, rangeEnd, 0);
+  GaugeAnalysisDebug *dbg = debugForGauge(gauge);
 
   const float ringInner = gauge.radius * 0.16f;
   const float ringOuter = gauge.radius * 1.00f;
@@ -1245,15 +1413,18 @@ GaugeReading analyzeGaugeHybrid(const camera_fb_t *fb, const GaugeConfig &gauge)
 
   HybridLineScore scoreA = scoreNeedleLineHybrid(fb, gauge, pcaAngleA, darkThreshold);
   HybridLineScore scoreB = scoreNeedleLineHybrid(fb, gauge, pcaAngleB, darkThreshold);
+  if (dbg) dbg->pointerCandidates = 2;
 
   float seedAngle = pcaAngleA;
   HybridLineScore seedScore = scoreA;
   const bool inRangeA = angleWithinGaugeRange(pcaAngleA, gauge);
   const bool inRangeB = angleWithinGaugeRange(pcaAngleB, gauge);
+  const float orientA = scoreA.score + (scoreA.tipReach * 70.0f) + (scoreA.weightedHitRatio * 45.0f);
+  const float orientB = scoreB.score + (scoreB.tipReach * 70.0f) + (scoreB.weightedHitRatio * 45.0f);
   if (!inRangeA && inRangeB) {
     seedAngle = pcaAngleB;
     seedScore = scoreB;
-  } else if (inRangeA == inRangeB && scoreB.score > scoreA.score) {
+  } else if (inRangeA == inRangeB && orientB > orientA) {
     seedAngle = pcaAngleB;
     seedScore = scoreB;
   }
@@ -1274,10 +1445,13 @@ GaugeReading analyzeGaugeHybrid(const camera_fb_t *fb, const GaugeConfig &gauge)
   }
 
   if (refineCount == 0) return reading;
+  if (dbg) dbg->scannedAngles = refineCount;
 
   int bestIndex = 0;
   for (int i = 1; i < refineCount; ++i) {
-    if (refineScores[i].score > refineScores[bestIndex].score) bestIndex = i;
+    const float candidate = refineScores[i].score + (refineScores[i].tipReach * 55.0f) + (refineScores[i].weightedHitRatio * 25.0f);
+    const float current = refineScores[bestIndex].score + (refineScores[bestIndex].tipReach * 55.0f) + (refineScores[bestIndex].weightedHitRatio * 25.0f);
+    if (candidate > current) bestIndex = i;
   }
 
   int secondIndex = -1;
@@ -1293,15 +1467,37 @@ GaugeReading analyzeGaugeHybrid(const camera_fb_t *fb, const GaugeConfig &gauge)
   const float hitRatio = (refineScores[bestIndex].samples > 0)
     ? (static_cast<float>(refineScores[bestIndex].hits) / refineScores[bestIndex].samples)
     : 0.0f;
+  const float weightedHitRatio = refineScores[bestIndex].weightedHitRatio;
+  const float tipReach = refineScores[bestIndex].tipReach;
 
   float confidence = 0.0f;
-  confidence += 0.42f * anisotropy;
-  confidence += 0.38f * clamp01(contrast / 42.0f);
-  confidence += 0.20f * clamp01((hitRatio - 0.15f) / 0.55f);
+  confidence += 0.30f * anisotropy;
+  confidence += 0.28f * clamp01(contrast / 42.0f);
+  confidence += 0.20f * clamp01((weightedHitRatio - 0.12f) / 0.58f);
+  confidence += 0.22f * tipReach;
   confidence = clamp01(confidence);
 
   const bool insideRange = angleWithinGaugeRange(refineAngles[bestIndex], gauge);
-  if (!insideRange || refineScores[bestIndex].hits < 10 || hitRatio < 0.18f || confidence < 0.10f) {
+  const float oppositeAngle = normalizeAngle180(refineAngles[bestIndex] + 180.0f);
+  const HybridLineScore oppositeScore = scoreNeedleLineHybrid(fb, gauge, oppositeAngle, darkThreshold);
+  const bool oppositeDominates = (oppositeScore.tipReach > (tipReach + 0.12f)) && (oppositeScore.score >= (bestScore * 0.90f));
+  if (dbg) {
+    dbg->selectedAngleDeg = refineAngles[bestIndex];
+    dbg->selectedScore = bestScore;
+    dbg->selectedTipReach = tipReach;
+    dbg->oppositeAngleDeg = oppositeAngle;
+    dbg->oppositeScore = oppositeScore.score;
+    dbg->oppositeTipReach = oppositeScore.tipReach;
+    dbg->oppositeDominates = oppositeDominates;
+  }
+  if (!insideRange || refineScores[bestIndex].hits < 10 || weightedHitRatio < 0.15f || tipReach < 0.42f || confidence < 0.10f || oppositeDominates) {
+    if (dbg) {
+      if (!insideRange) dbg->selectedReason = "rejected_out_of_range";
+      else if (oppositeDominates) dbg->selectedReason = "rejected_opposite_dominates";
+      else if (tipReach < 0.42f) dbg->selectedReason = "rejected_short_tip_reach";
+      else if (weightedHitRatio < 0.15f) dbg->selectedReason = "rejected_low_hit_ratio";
+      else dbg->selectedReason = "rejected_low_confidence";
+    }
     return reading;
   }
 
@@ -1310,10 +1506,11 @@ GaugeReading analyzeGaugeHybrid(const camera_fb_t *fb, const GaugeConfig &gauge)
   reading.value = angleToValue(reading.angleDeg, gauge);
   reading.confidence = confidence;
   reading.darkness = refineScores[bestIndex].grayLevel;
+  if (dbg) dbg->selectedReason = "selected_best_hybrid_score";
   return reading;
 }
 
-float scoreClassicDarkness(const camera_fb_t *fb, const GaugeConfig &gauge, float angleDeg, float &grayLevel) {
+float scoreClassicDarkness(const camera_fb_t *fb, const GaugeConfig &gauge, float angleDeg, float &grayLevel, float &tipReachOut) {
   const float angleRad = angleToRadians(angleDeg);
   const float dirX = cosf(angleRad);
   const float dirY = sinf(angleRad);
@@ -1324,22 +1521,34 @@ float scoreClassicDarkness(const camera_fb_t *fb, const GaugeConfig &gauge, floa
   const float step = max(1.0f, gauge.radius / 28.0f);
 
   uint32_t sum = 0;
+  float weightedDarknessSum = 0.0f;
+  float weightSum = 0.0f;
+  float maxDarkRadius = 0.0f;
   uint16_t samples = 0;
   for (float radius = startRadius; radius <= endRadius; radius += step) {
+    const float radiusWeight = radialPriority(radius, startRadius, endRadius);
     for (int offset = -2; offset <= 2; ++offset) {
       const int x = lroundf(gauge.cx + dirX * radius + perpX * offset);
       const int y = lroundf(gauge.cy + dirY * radius + perpY * offset);
       uint8_t gray = 0;
       if (!sampleGray(fb, x, y, gray)) continue;
       sum += gray;
+      weightedDarknessSum += (255.0f - gray) * radiusWeight;
+      weightSum += radiusWeight;
+      if (gray <= 170 && radius > maxDarkRadius) maxDarkRadius = radius;
       ++samples;
     }
     delay(0);
   }
 
   grayLevel = samples > 0 ? (static_cast<float>(sum) / samples) : 255.0f;
-  // Higher is better for unified selection logic.
-  return 255.0f - grayLevel;
+  if (weightSum <= 0.0f) return 0.0f;
+
+  const float weightedDarkness = weightedDarknessSum / weightSum;
+  const float tipReach = clamp01((maxDarkRadius - startRadius) / max(1.0f, endRadius - startRadius));
+  tipReachOut = tipReach;
+  // Higher is better for unified selection logic; tipReach helps reject short thick counterweight.
+  return weightedDarkness + (tipReach * 36.0f);
 }
 
 AngleScore scoreNeedleAngleColor(const camera_fb_t *fb, const GaugeConfig &gauge, const AnalysisColorProfile &profile, float angleDeg) {
@@ -1355,10 +1564,14 @@ AngleScore scoreNeedleAngleColor(const camera_fb_t *fb, const GaugeConfig &gauge
   AngleScore score;
   uint32_t graySum = 0;
   float redSum = 0.0f;
+  float weightedHits = 0.0f;
+  float totalWeight = 0.0f;
+  float maxNeedleRadius = 0.0f;
   uint16_t redHits = 0;
   uint16_t samples = 0;
   uint16_t iter = 0;
   for (float radius = startRadius; radius <= endRadius; radius += step) {
+    const float radiusWeight = radialPriority(radius, startRadius, endRadius);
     for (int offset = -1; offset <= 1; ++offset) {
       const int x = lroundf(gauge.cx + dirX * radius + perpX * offset);
       const int y = lroundf(gauge.cy + dirY * radius + perpY * offset);
@@ -1380,10 +1593,13 @@ AngleScore scoreNeedleAngleColor(const camera_fb_t *fb, const GaugeConfig &gauge
 
       const bool looksNeedle = (proximityNeedle >= 28.0f) && (dNeedle < dBg) && (dNeedle < dText);
       if (looksNeedle) {
-        redSum += weighted;
+        redSum += weighted * radiusWeight;
+        weightedHits += radiusWeight;
+        if (radius > maxNeedleRadius) maxNeedleRadius = radius;
         ++redHits;
       }
 
+      totalWeight += radiusWeight;
       graySum += gray;
       ++samples;
       ++iter;
@@ -1401,8 +1617,9 @@ AngleScore scoreNeedleAngleColor(const camera_fb_t *fb, const GaugeConfig &gauge
     return score;
   }
 
-  const float hitRatio = static_cast<float>(redHits) / samples;
-  score.redStrength = (redSum / redHits) + (hitRatio * 90.0f);
+  const float hitRatio = (totalWeight > 0.0f) ? (weightedHits / totalWeight) : 0.0f;
+  score.tipReach = clamp01((maxNeedleRadius - startRadius) / max(1.0f, endRadius - startRadius));
+  score.redStrength = (redSum / max(0.001f, weightedHits)) + (hitRatio * 90.0f) + (score.tipReach * 44.0f);
   return score;
 }
 
@@ -1414,16 +1631,22 @@ GaugeReading analyzeGaugeClassic(const camera_fb_t *fb, const GaugeConfig &gauge
   constexpr int kMaxSamples = 181;
   float scores[kMaxSamples];
   float grayLevels[kMaxSamples];
+  float tipReaches[kMaxSamples];
   float angles[kMaxSamples];
   int count = 0;
 
-  const float start = min(gauge.angleMin, gauge.angleMax);
-  const float end = max(gauge.angleMin, gauge.angleMax);
+  float start = 0.0f;
+  float end = 0.0f;
+  expandedGaugeRange(gauge, start, end);
+  resetGaugeDebug(gauge, start, end, 0);
+  GaugeAnalysisDebug *dbg = debugForGauge(gauge);
   for (float angle = start; angle <= end && count < kMaxSamples; angle += kAngleStep) {
     angles[count] = angle;
     float gray = 255.0f;
-    scores[count] = scoreClassicDarkness(fb, gauge, angle, gray);
+    float tipReach = 0.0f;
+    scores[count] = scoreClassicDarkness(fb, gauge, angle, gray, tipReach);
     grayLevels[count] = gray;
+    tipReaches[count] = tipReach;
     ++count;
     if ((count % 12) == 0) {
       delay(0);
@@ -1431,6 +1654,7 @@ GaugeReading analyzeGaugeClassic(const camera_fb_t *fb, const GaugeConfig &gauge
   }
 
   if (count == 0) return reading;
+  if (dbg) dbg->scannedAngles = count;
 
   int bestIndex = 0;
   for (int i = 1; i < count; ++i) {
@@ -1446,9 +1670,30 @@ GaugeReading analyzeGaugeClassic(const camera_fb_t *fb, const GaugeConfig &gauge
   const float bestScore = scores[bestIndex];
   const float secondScore = secondIndex >= 0 ? scores[secondIndex] : 0.0f;
   const float contrast = max(0.0f, bestScore - secondScore);
-  const float confidence = clamp01(contrast / 45.0f);
+  const float confidence = clamp01((contrast / 45.0f) + (0.28f * tipReaches[bestIndex]));
 
-  if (grayLevels[bestIndex] > 220.0f || confidence < 0.08f) {
+  const float oppositeAngle = normalizeAngle180(angles[bestIndex] + 180.0f);
+  float oppositeGray = 255.0f;
+  float oppositeTip = 0.0f;
+  const float oppositeScore = scoreClassicDarkness(fb, gauge, oppositeAngle, oppositeGray, oppositeTip);
+  const bool oppositeDominates = (oppositeTip > (tipReaches[bestIndex] + 0.12f)) && (oppositeScore >= (bestScore * 0.90f));
+  if (dbg) {
+    dbg->pointerCandidates = (oppositeScore > 1.0f || oppositeTip > 0.12f) ? 2 : 1;
+    dbg->selectedAngleDeg = angles[bestIndex];
+    dbg->selectedScore = bestScore;
+    dbg->selectedTipReach = tipReaches[bestIndex];
+    dbg->oppositeAngleDeg = oppositeAngle;
+    dbg->oppositeScore = oppositeScore;
+    dbg->oppositeTipReach = oppositeTip;
+    dbg->oppositeDominates = oppositeDominates;
+  }
+
+  if (grayLevels[bestIndex] > 220.0f || confidence < 0.08f || oppositeDominates) {
+    if (dbg) {
+      if (oppositeDominates) dbg->selectedReason = "rejected_opposite_dominates";
+      else if (grayLevels[bestIndex] > 220.0f) dbg->selectedReason = "rejected_too_bright";
+      else dbg->selectedReason = "rejected_low_confidence";
+    }
     return reading;
   }
 
@@ -1457,6 +1702,7 @@ GaugeReading analyzeGaugeClassic(const camera_fb_t *fb, const GaugeConfig &gauge
   reading.value = angleToValue(reading.angleDeg, gauge);
   reading.confidence = confidence;
   reading.darkness = grayLevels[bestIndex];
+  if (dbg) dbg->selectedReason = "selected_best_darkness_score";
   return reading;
 }
 
@@ -1468,16 +1714,21 @@ GaugeReading analyzeGaugeColor(const camera_fb_t *fb, const GaugeConfig &gauge, 
   constexpr int kMaxSamples = 181;
   float scores[kMaxSamples];
   float grayLevels[kMaxSamples];
+  float tipReaches[kMaxSamples];
   float angles[kMaxSamples];
   int count = 0;
 
-  const float start = min(gauge.angleMin, gauge.angleMax);
-  const float end = max(gauge.angleMin, gauge.angleMax);
+  float start = 0.0f;
+  float end = 0.0f;
+  expandedGaugeRange(gauge, start, end);
+  resetGaugeDebug(gauge, start, end, 0);
+  GaugeAnalysisDebug *dbg = debugForGauge(gauge);
   for (float angle = start; angle <= end && count < kMaxSamples; angle += kAngleStep) {
     angles[count] = angle;
     const AngleScore score = scoreNeedleAngleColor(fb, gauge, profile, angle);
     scores[count] = score.redStrength;
     grayLevels[count] = score.grayLevel;
+    tipReaches[count] = score.tipReach;
     ++count;
     if ((count % 12) == 0) {
       delay(0);
@@ -1485,6 +1736,7 @@ GaugeReading analyzeGaugeColor(const camera_fb_t *fb, const GaugeConfig &gauge, 
   }
 
   if (count == 0) return reading;
+  if (dbg) dbg->scannedAngles = count;
 
   int bestIndex = 0;
   for (int i = 1; i < count; ++i) {
@@ -1500,9 +1752,28 @@ GaugeReading analyzeGaugeColor(const camera_fb_t *fb, const GaugeConfig &gauge, 
   const float bestScore = scores[bestIndex];
   const float secondScore = secondIndex >= 0 ? scores[secondIndex] : 0.0f;
   const float contrast = max(0.0f, bestScore - secondScore);
-  const float confidence = clamp01(contrast / 40.0f);
+  const float confidence = clamp01((contrast / 46.0f) + (0.35f * tipReaches[bestIndex]));
 
-  if (bestScore < 14.0f || confidence < 0.05f) {
+  const float oppositeAngle = normalizeAngle180(angles[bestIndex] + 180.0f);
+  const AngleScore opposite = scoreNeedleAngleColor(fb, gauge, profile, oppositeAngle);
+  const bool oppositeDominates = (opposite.tipReach > (tipReaches[bestIndex] + 0.12f)) && (opposite.redStrength >= (bestScore * 0.90f));
+  if (dbg) {
+    dbg->pointerCandidates = (opposite.redStrength > 8.0f || opposite.tipReach > 0.12f) ? 2 : 1;
+    dbg->selectedAngleDeg = angles[bestIndex];
+    dbg->selectedScore = bestScore;
+    dbg->selectedTipReach = tipReaches[bestIndex];
+    dbg->oppositeAngleDeg = oppositeAngle;
+    dbg->oppositeScore = opposite.redStrength;
+    dbg->oppositeTipReach = opposite.tipReach;
+    dbg->oppositeDominates = oppositeDominates;
+  }
+
+  if (bestScore < 14.0f || confidence < 0.05f || oppositeDominates) {
+    if (dbg) {
+      if (oppositeDominates) dbg->selectedReason = "rejected_opposite_dominates";
+      else if (bestScore < 14.0f) dbg->selectedReason = "rejected_low_color_score";
+      else dbg->selectedReason = "rejected_low_confidence";
+    }
     return reading;
   }
 
@@ -1511,6 +1782,7 @@ GaugeReading analyzeGaugeColor(const camera_fb_t *fb, const GaugeConfig &gauge, 
   reading.value = angleToValue(reading.angleDeg, gauge);
   reading.confidence = confidence;
   reading.darkness = grayLevels[bestIndex];
+  if (dbg) dbg->selectedReason = "selected_best_color_score";
   return reading;
 }
 
@@ -1533,11 +1805,19 @@ String buildAnalysisJson(const DeviceConfig &config, const GaugeReading readings
   else if (!g1) status = "gauge_1_not_detected";
   else if (!g2) status = "gauge_2_not_detected";
 
+  int detectedGaugeCount = 0;
+  int pointerCandidatesTotal = 0;
+  for (uint8_t i = 0; i < kGaugeCount; ++i) {
+    if (readings[i].detected) ++detectedGaugeCount;
+    pointerCandidatesTotal += gLastGaugeDebug[i].pointerCandidates;
+  }
+
   String json = "{";
   json += "\"device_id\":\"" + jsonEscape(config.deviceId) + "\",";
   json += "\"status\":\"" + status + "\",";
   json += "\"source\":\"" + String(currentAnalysisSourceName()) + "\",";
   json += "\"frame\":{\"width\":" + String(frameWidth) + ",\"height\":" + String(frameHeight) + "},";
+  json += "\"debug\":{\"detected_gauges\":" + String(detectedGaugeCount) + ",\"pointer_candidates_total\":" + String(pointerCandidatesTotal) + "},";
   json += "\"processing_ms\":" + String(elapsedMs) + ',';
   json += "\"gauges\":[";
 
@@ -1555,6 +1835,23 @@ String buildAnalysisJson(const DeviceConfig &config, const GaugeReading readings
       json += ",\"value\":" + String(readings[i].value, 3);
       json += ",\"confidence\":" + String(readings[i].confidence, 3);
       json += ",\"darkness\":" + String(readings[i].darkness, 1);
+    }
+    const GaugeAnalysisDebug &dbg = gLastGaugeDebug[i];
+    if (dbg.enabled) {
+      json += ",\"debug\":{";
+      json += "\"search_start_deg\":" + String(dbg.searchStartDeg, 2) + ',';
+      json += "\"search_end_deg\":" + String(dbg.searchEndDeg, 2) + ',';
+      json += "\"scanned_angles\":" + String(dbg.scannedAngles) + ',';
+      json += "\"pointer_candidates\":" + String(dbg.pointerCandidates) + ',';
+      json += "\"selected_angle_deg\":" + String(dbg.selectedAngleDeg, 2) + ',';
+      json += "\"selected_score\":" + String(dbg.selectedScore, 3) + ',';
+      json += "\"selected_tip_reach\":" + String(dbg.selectedTipReach, 3) + ',';
+      json += "\"opposite_angle_deg\":" + String(dbg.oppositeAngleDeg, 2) + ',';
+      json += "\"opposite_score\":" + String(dbg.oppositeScore, 3) + ',';
+      json += "\"opposite_tip_reach\":" + String(dbg.oppositeTipReach, 3) + ',';
+      json += "\"opposite_dominates\":" + String(dbg.oppositeDominates ? "true" : "false") + ',';
+      json += "\"selected_reason\":\"" + jsonEscape(dbg.selectedReason.length() ? dbg.selectedReason : String("not_set")) + "\"";
+      json += '}';
     }
     json += '}';
   }
@@ -1911,6 +2208,39 @@ void handleClearLogs() {
   }
 
   logEvent("LOG", "Log cleared from web UI");
+  server.send(200, "text/plain", "ok");
+}
+
+void handleUploadBody() {
+  HTTPUpload &upload = server.upload();
+  if (!gStorageReady) return;
+  if (upload.status == UPLOAD_FILE_START) {
+    if (SD_MMC.exists(kPhotoPath)) SD_MMC.remove(kPhotoPath);
+    gUploadFile = SD_MMC.open(kPhotoPath, FILE_WRITE);
+    if (!gUploadFile) Serial.println("[UPLOAD] Cannot open file for write");
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (gUploadFile) gUploadFile.write(upload.buf, upload.currentSize);
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (gUploadFile) gUploadFile.close();
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (gUploadFile) { gUploadFile.close(); SD_MMC.remove(kPhotoPath); }
+  }
+}
+
+void handleUploadDone() {
+  if (!checkAuth()) {
+    if (gStorageReady) SD_MMC.remove(kPhotoPath);
+    return;
+  }
+  if (!gStorageReady) {
+    server.send(503, "text/plain", "storage_not_ready");
+    return;
+  }
+  if (!SD_MMC.exists(kPhotoPath)) {
+    server.send(500, "text/plain", "upload_failed");
+    return;
+  }
+  logEvent("UPLOAD", String("JPEG uploaded -> ") + kPhotoPath);
   server.send(200, "text/plain", "ok");
 }
 
@@ -2303,6 +2633,7 @@ void setupWebServer() {
   server.on("/modbus/status", HTTP_GET, handleGetModbusStatus);
   server.on("/logs", HTTP_GET, handleGetLogs);
   server.on("/logs/clear", HTTP_POST, handleClearLogs);
+  server.on("/upload", HTTP_POST, handleUploadDone, handleUploadBody);
   server.begin();
   logEvent("WEB", "Server started on port 80");
 }
