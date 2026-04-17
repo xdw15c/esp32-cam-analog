@@ -23,24 +23,28 @@ Najwazniejsze funkcje, ktore sa juz wdrozone:
 - zakladka Logi w WWW (podglad + czyszczenie)
 - Modbus TCP z mapa 16 rejestrow
 - fault_code i analysis_source w Modbus
-- tryb offline SD (analiza z /latest.jpg, bez inicjalizacji kamery)
+- runtime wybor zrodla analizy (auto / camera / sd_photo)
 - upload JPEG z WWW do /latest.jpg
 - debug decyzji analizy w JSON (powod wyboru/odrzucenia kata)
 
 ## Tryby zrodla obrazu
 
-Firmware obsluguje 3 praktyczne scenariusze:
+Firmware obsluguje 3 praktyczne scenariusze w jednym buildzie:
 
-1. Kamera live
-- docelowy tryb produkcyjny po naprawie hardware kamery
+1. auto
+- rekomendowany tryb produkcyjny
+- najpierw probuje kamere live
+- przy niedostepnej kamerze przechodzi na /latest.jpg z SD
 
-2. Plik z SD (/latest.jpg)
-- aktywny tryb awaryjny/offline
-- kamera nie jest wymagana
+2. camera
+- wymusza analize tylko z kamery live
+- przydatne po naprawie hardware i do testow live
 
-3. Upload z WWW
-- przeslany plik JPEG jest zapisywany jako /latest.jpg
-- dalsza analiza dziala jak dla zrodla SD
+3. sd_photo
+- wymusza analize tylko z /latest.jpg
+- najlepsze do debugowania i testow na obrazach z komputera
+
+Upload z WWW zawsze zapisuje obraz do /latest.jpg.
 
 ## API HTTP
 
@@ -64,6 +68,7 @@ Przyklad (skrocony):
 ```json
 {
   "status": "ok",
+  "analysis_input_mode": "auto",
   "source": "sd_photo",
   "gauges": [
     {
@@ -102,12 +107,22 @@ W zakladce Modbus jest teraz:
 - opis mapy rejestrow
 - dekodowanie kodow status/fault/source
 
+W ustawieniach urzadzenia dostepny jest wybor `analysis_input_source`:
+
+- auto
+- camera
+- sd_photo
+
+Wybor jest zapisywany do /config/config.json i odtwarzany po restarcie.
+
 ## Szybkie uruchomienie
 
 1. Uzupelnij include/secrets.h.
 2. Wgraj firmware.
-3. Wloz SD i przygotuj /latest.jpg (lub uzyj uploadu z WWW).
-4. Wejdz na panel WWW i uruchom analize.
+3. Wloz karte SD.
+4. Wejdz na panel WWW i wybierz tryb zrodla analizy (zalecane: auto).
+5. W razie potrzeby wgraj obraz testowy przez upload (zapis do /latest.jpg).
+6. Uruchom analize.
 
 ## Uwagi
 

@@ -30,7 +30,6 @@
 #define FLASH_LED_GPIO_NUM 4
 
 static const uint16_t kFlashWarmupMs = 70;
-static const bool kOfflineSdPhotoMode = true;
 static bool gFlashEnabled = true;
 static uint32_t gAnalysisIntervalMs = 60000;
 static const uint32_t kMinAnalysisIntervalMs = 10000;
@@ -78,6 +77,49 @@ static const uint8_t kGaugeCount = 2;
 static File gUploadFile;
 static const float kAngleSearchMarginDeg = 8.0f;
 
+enum class AnalysisInputMode : uint8_t {
+  Auto = 0,
+  Camera = 1,
+  SdPhoto = 2
+};
+
+enum class AnalysisSourceCode : uint16_t {
+  Unavailable = 0,
+  CameraLive = 1,
+  SdPhoto = 2
+};
+
+static AnalysisInputMode gAnalysisInputMode = AnalysisInputMode::Auto;
+static AnalysisSourceCode gLastAnalysisSource = AnalysisSourceCode::Unavailable;
+
+const char *analysisInputModeName(AnalysisInputMode mode) {
+  switch (mode) {
+    case AnalysisInputMode::Camera:
+      return "camera";
+    case AnalysisInputMode::SdPhoto:
+      return "sd_photo";
+    case AnalysisInputMode::Auto:
+    default:
+      return "auto";
+  }
+}
+
+bool parseAnalysisInputMode(const String &value, AnalysisInputMode &mode) {
+  if (value == "camera") {
+    mode = AnalysisInputMode::Camera;
+    return true;
+  }
+  if (value == "sd_photo" || value == "sd") {
+    mode = AnalysisInputMode::SdPhoto;
+    return true;
+  }
+  if (value == "auto") {
+    mode = AnalysisInputMode::Auto;
+    return true;
+  }
+  return false;
+}
+
 struct GaugeConfig {
   int id = 0;
   String name;
@@ -100,6 +142,7 @@ struct DeviceConfig {
   String deviceId = "esp32cam-01";
   int intervalS = 60;
   bool flashEnabled = true;
+  String analysisInputSource = "auto";
   GaugeConfig gauges[kGaugeCount];
   bool loaded = false;
 };
@@ -235,7 +278,7 @@ select,input[type=color]{width:100%;border:1px solid #cbd5e1;border-radius:6px;p
 <div id="tab-cam" class="page active">
   <div class="card">
     <div class="row">
-      <button onclick="capture()">&#128247; Uzyj zdjecia z SD</button>
+      <button onclick="capture()">&#128247; Zrob zdjecie / odswiez SD</button>
       <button class="grn" onclick="analyzeCapture()">&#129504; Analizuj obraz</button>
       <button class="sec" onclick="reloadCam()">&#8635; Odswiez</button>
       <input type="file" id="upload-input" accept=".jpg,.jpeg,image/jpeg" style="display:none" onchange="uploadPhoto(this)">
@@ -340,6 +383,12 @@ select,input[type=color]{width:100%;border:1px solid #cbd5e1;border-radius:6px;p
         <input type="checkbox" id="flash-enabled" checked onchange="updatePreview()">
         Uzyj diody flash podczas robienia zdjecia
       </label>
+      <label>Zrodlo analizy obrazu</label>
+      <select id="analysis-input-source" onchange="updatePreview()">
+        <option value="auto">Auto (kamera, a przy bledzie SD)</option>
+        <option value="camera">Tylko kamera live</option>
+        <option value="sd_photo">Tylko plik SD (/latest.jpg)</option>
+      </select>
       <label>Czas pomiedzy automatycznym zdjeciem i analiza (sekundy)</label>
       <input type="number" id="auto-interval-s" min="10" max="3600" value="60" oninput="updatePreview()">
       <p class="hint" style="margin-top:.4rem">Zakres: 10..3600 s</p>
@@ -497,10 +546,12 @@ cRoi.addEventListener('click',ev=>{
 
 function buildConfig(){
   const autoInterval=Math.max(10,Math.min(3600,gv('auto-interval-s')||60));
+  const sourceEl=document.getElementById('analysis-input-source');
   return{
     device_id:'esp32cam-01',
     interval_s:autoInterval,
     flash_enabled:!!document.getElementById('flash-enabled').checked,
+    analysis_input_source:sourceEl?sourceEl.value:'auto',
     gauges:[1,2].map(n=>{
       const p='g'+n;
       return{id:n,name:document.getElementById(p+'-name').value,
@@ -520,8 +571,10 @@ function applyConfig(cfg){
   if(!cfg||!Array.isArray(cfg.gauges))return;
   const flashEl=document.getElementById('flash-enabled');
   const intervalEl=document.getElementById('auto-interval-s');
+  const sourceEl=document.getElementById('analysis-input-source');
   if(flashEl)flashEl.checked=(cfg.flash_enabled!==false);
   if(intervalEl)intervalEl.value=Math.max(10,Math.min(3600,(+cfg.interval_s)||60));
+  if(sourceEl)sourceEl.value=(cfg.analysis_input_source||'auto');
   cfg.gauges.forEach(g=>{
     const n=g.id,p='g'+n;
     const s=(id,v)=>{const el=document.getElementById(id);if(el&&v!==undefined)el.value=v;};
@@ -657,7 +710,7 @@ async function loadModbusStatus(){
     }
     const data=await r.json();
     conn.textContent='IP: '+data.ip+'\nPort: '+data.port+'\nUnit ID: '+data.unit_id+'\nFunkcja: '+data.function;
-    state.textContent='WiFi: '+data.wifi_status+'\nRSSI: '+data.rssi_dbm+' dBm\nHeartbeat: '+data.heartbeat+'\nStatus: '+decodeStatusCode((data.registers&&data.registers[0])?data.registers[0].u16:0)+'\nFault: '+decodeFaultCode(data.fault_code||0)+'\nSource: '+decodeAnalysisSource((data.registers&&data.registers[11])?data.registers[11].u16:0);
+    state.textContent='WiFi: '+data.wifi_status+'\nRSSI: '+data.rssi_dbm+' dBm\nHeartbeat: '+data.heartbeat+'\nStatus: '+decodeStatusCode((data.registers&&data.registers[0])?data.registers[0].u16:0)+'\nFault: '+decodeFaultCode(data.fault_code||0)+'\nSource: '+decodeAnalysisSource((data.registers&&data.registers[11])?data.registers[11].u16:0)+'\nInput mode: '+(data.analysis_input_mode||'auto')+'\nCamera ready: '+(data.camera_ready?'yes':'no')+'\nStorage ready: '+(data.storage_ready?'yes':'no');
     regs.textContent=renderModbusRegisters(data.registers);
     if(help)help.textContent=renderModbusHelp(data);
   }catch(e){
@@ -974,6 +1027,7 @@ bool loadDeviceConfig(DeviceConfig &config) {
   jsonExtractString(json, "device_id", config.deviceId);
   jsonExtractInt(json, "interval_s", config.intervalS);
   jsonExtractBool(json, "flash_enabled", config.flashEnabled);
+  jsonExtractString(json, "analysis_input_source", config.analysisInputSource);
 
   String legacyMode = "color_target";
   String legacyNeedle = "#D00000";
@@ -1045,6 +1099,13 @@ bool loadDeviceConfig(DeviceConfig &config) {
 
 void applyRuntimeSettings(const DeviceConfig &config) {
   gFlashEnabled = config.flashEnabled;
+
+  AnalysisInputMode parsedMode = AnalysisInputMode::Auto;
+  if (parseAnalysisInputMode(config.analysisInputSource, parsedMode)) {
+    gAnalysisInputMode = parsedMode;
+  } else {
+    gAnalysisInputMode = AnalysisInputMode::Auto;
+  }
 
   int intervalS = config.intervalS;
   if (intervalS < static_cast<int>(kMinAnalysisIntervalMs / 1000)) intervalS = static_cast<int>(kMinAnalysisIntervalMs / 1000);
@@ -1138,15 +1199,27 @@ uint16_t currentFaultCode() {
 }
 
 uint16_t currentAnalysisSourceCode() {
-  if (kOfflineSdPhotoMode) return 2;
-  return gCameraReady ? 1 : 0;
+  if (gLastAnalysisSource != AnalysisSourceCode::Unavailable) {
+    return static_cast<uint16_t>(gLastAnalysisSource);
+  }
+
+  switch (gAnalysisInputMode) {
+    case AnalysisInputMode::Camera:
+      return gCameraReady ? static_cast<uint16_t>(AnalysisSourceCode::CameraLive) : static_cast<uint16_t>(AnalysisSourceCode::Unavailable);
+    case AnalysisInputMode::SdPhoto:
+      return (gStorageReady && SD_MMC.exists(kPhotoPath)) ? static_cast<uint16_t>(AnalysisSourceCode::SdPhoto) : static_cast<uint16_t>(AnalysisSourceCode::Unavailable);
+    case AnalysisInputMode::Auto:
+    default:
+      if (gCameraReady) return static_cast<uint16_t>(AnalysisSourceCode::CameraLive);
+      return (gStorageReady && SD_MMC.exists(kPhotoPath)) ? static_cast<uint16_t>(AnalysisSourceCode::SdPhoto) : static_cast<uint16_t>(AnalysisSourceCode::Unavailable);
+  }
 }
 
 const char *currentAnalysisSourceName() {
-  switch (currentAnalysisSourceCode()) {
-    case 1:
+  switch (static_cast<AnalysisSourceCode>(currentAnalysisSourceCode())) {
+    case AnalysisSourceCode::CameraLive:
       return "camera_live";
-    case 2:
+    case AnalysisSourceCode::SdPhoto:
       return "sd_photo";
     default:
       return "unavailable";
@@ -1815,6 +1888,7 @@ String buildAnalysisJson(const DeviceConfig &config, const GaugeReading readings
   String json = "{";
   json += "\"device_id\":\"" + jsonEscape(config.deviceId) + "\",";
   json += "\"status\":\"" + status + "\",";
+  json += "\"analysis_input_mode\":\"" + String(analysisInputModeName(gAnalysisInputMode)) + "\",";
   json += "\"source\":\"" + String(currentAnalysisSourceName()) + "\",";
   json += "\"frame\":{\"width\":" + String(frameWidth) + ",\"height\":" + String(frameHeight) + "},";
   json += "\"debug\":{\"detected_gauges\":" + String(detectedGaugeCount) + ",\"pointer_candidates_total\":" + String(pointerCandidatesTotal) + "},";
@@ -1970,21 +2044,42 @@ bool loadAnalysisFrameFromSd(AnalysisFrame &frame, String &error) {
 }
 
 bool loadAnalysisFrame(AnalysisFrame &frame, String &error) {
-  if (kOfflineSdPhotoMode) {
-    return loadAnalysisFrameFromSd(frame, error);
-  }
+  gLastAnalysisSource = AnalysisSourceCode::Unavailable;
 
-  if (!gCameraReady) {
-    error = "camera_not_ready";
-    return false;
-  }
+  auto tryCamera = [&]() -> bool {
+    if (!gCameraReady) {
+      error = "camera_not_ready";
+      return false;
+    }
+    frame.fb = captureFrameWithFlash();
+    if (!frame.fb) {
+      error = "capture_failed";
+      return false;
+    }
+    gLastAnalysisSource = AnalysisSourceCode::CameraLive;
+    return true;
+  };
 
-  frame.fb = captureFrameWithFlash();
-  if (!frame.fb) {
-    error = "capture_failed";
-    return false;
+  auto trySd = [&]() -> bool {
+    if (!loadAnalysisFrameFromSd(frame, error)) {
+      return false;
+    }
+    gLastAnalysisSource = AnalysisSourceCode::SdPhoto;
+    return true;
+  };
+
+  switch (gAnalysisInputMode) {
+    case AnalysisInputMode::Camera:
+      return tryCamera();
+    case AnalysisInputMode::SdPhoto:
+      return trySd();
+    case AnalysisInputMode::Auto:
+    default:
+      if (gCameraReady) {
+        return tryCamera();
+      }
+      return trySd();
   }
-  return true;
 }
 
 void releaseAnalysisFrame(AnalysisFrame &frame) {
@@ -1998,25 +2093,17 @@ void releaseAnalysisFrame(AnalysisFrame &frame) {
 }
 
 bool captureAndSave() {
-  if (kOfflineSdPhotoMode) {
-    if (!gStorageReady) {
-      Serial.println("[SD] Storage not ready");
-      return false;
-    }
-    if (!SD_MMC.exists(kPhotoPath)) {
-      Serial.println("[SD] Offline source photo missing");
-      return false;
-    }
-    Serial.println("[SD] Offline source photo ready");
-    return true;
+  if (!gStorageReady) {
+    Serial.println("[SD] Storage not ready");
+    return false;
   }
 
   if (!gCameraReady) {
-    Serial.println("[CAM] Camera not ready");
-    return false;
-  }
-  if (!gStorageReady) {
-    Serial.println("[SD] Storage not ready");
+    if (SD_MMC.exists(kPhotoPath)) {
+      Serial.println("[SD] Camera unavailable, keeping existing photo");
+      return true;
+    }
+    Serial.println("[CAM] Camera not ready and no fallback photo on SD");
     return false;
   }
 
@@ -2046,7 +2133,7 @@ void handleRoot() {
 void handleCapture() {
   if (!checkAuth()) return;
   if (!captureAndSave()) {
-    server.send(kOfflineSdPhotoMode ? 404 : 500, "text/plain", kOfflineSdPhotoMode ? "photo_not_found" : "capture_failed");
+    server.send(gCameraReady ? 500 : 404, "text/plain", gCameraReady ? "capture_failed" : "photo_not_found");
     return;
   }
   server.send(200, "text/plain", "ok");
@@ -2090,7 +2177,8 @@ void handleAnalyze() {
 
   const int frameWidth = fb->width;
   const int frameHeight = fb->height;
-  const bool photoOk = kOfflineSdPhotoMode ? true : saveFrameAsJpeg(fb, kPhotoPath);
+  const bool sourceFromCamera = (frame.fb != &frame.ownedFb);
+  const bool photoOk = sourceFromCamera ? saveFrameAsJpeg(fb, kPhotoPath) : true;
   const String response = buildAnalysisJson(config, readings, frameWidth, frameHeight, millis() - start);
   releaseAnalysisFrame(frame);
 
@@ -2099,8 +2187,8 @@ void handleAnalyze() {
     return;
   }
 
-  Serial.printf("[CV] Analysis done in %u ms  source=%s  frame=%dx%d\n",
-    static_cast<unsigned>(millis() - start), currentAnalysisSourceName(), frameWidth, frameHeight);
+  Serial.printf("[CV] Analysis done in %u ms  source=%s  mode=%s  frame=%dx%d\n",
+    static_cast<unsigned>(millis() - start), currentAnalysisSourceName(), analysisInputModeName(gAnalysisInputMode), frameWidth, frameHeight);
   for (uint8_t i = 0; i < kGaugeCount; ++i) {
     const GaugeReading &r = readings[i];
     const GaugeConfig  &g = config.gauges[i];
@@ -2255,7 +2343,10 @@ String buildModbusStatusJson() {
   json += "\"rssi_dbm\":" + String(static_cast<int16_t>(modbusHolding[REG_WIFI_RSSI])) + ',';
   json += "\"heartbeat\":" + String(modbusHolding[REG_HEARTBEAT]) + ',';
   json += "\"fault_code\":" + String(modbusHolding[REG_FAULT_CODE]) + ',';
+  json += "\"analysis_input_mode\":\"" + String(analysisInputModeName(gAnalysisInputMode)) + "\",";
   json += "\"analysis_source\":\"" + String(currentAnalysisSourceName()) + "\",";
+  json += "\"camera_ready\":" + String(gCameraReady ? "true" : "false") + ',';
+  json += "\"storage_ready\":" + String(gStorageReady ? "true" : "false") + ',';
   json += "\"registers\":[";
   for (uint16_t i = 0; i < kModbusRegCount; ++i) {
     if (i > 0) json += ',';
@@ -2521,11 +2612,6 @@ camera_fb_t *captureFrameWithFlash() {
 }
 
 bool setupCamera() {
-  if (kOfflineSdPhotoMode) {
-    logEvent("CAM", "Camera init skipped: offline SD photo analysis mode");
-    return false;
-  }
-
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -2654,15 +2740,13 @@ void setup() {
   }
 
   gCameraReady = setupCamera();
-  if (kOfflineSdPhotoMode) {
-    logEvent("BOOT", "Camera init skipped -> offline SD photo analysis mode");
-  } else if (!gCameraReady) {
+  if (!gCameraReady) {
     logEvent("BOOT", "Warning: camera setup failed -> safe mode path active");
   } else {
     logEvent("BOOT", "Camera setup OK");
   }
 
-  if (!gStorageReady || (!gCameraReady && !kOfflineSdPhotoMode)) {
+  if (!gStorageReady) {
     setEmergencyFault(
       (!gStorageReady && !gCameraReady)
         ? EmergencyFault::StorageAndCamera
@@ -2683,10 +2767,14 @@ void setup() {
   DeviceConfig config;
   if (loadDeviceConfig(config)) {
     applyRuntimeSettings(config);
+    logEvent("CFG", String("analysis_input_source=") + analysisInputModeName(gAnalysisInputMode));
+  } else {
+    gAnalysisInputMode = AnalysisInputMode::Auto;
+    logEvent("CFG", "No config found, using defaults (analysis_input_source=auto)");
   }
 
   if (!captureAndSave()) {
-    logEvent("BOOT", kOfflineSdPhotoMode ? "Offline source photo missing during startup" : "Initial capture failed (continuing)");
+    logEvent("BOOT", "Initial capture/fallback photo check failed (continuing)");
   }
   logEvent("BOOT", "Setup completed");
 }
@@ -2728,13 +2816,14 @@ static void runPeriodicAnalysis() {
 
   const int frameWidth = fb->width;
   const int frameHeight = fb->height;
-  if (!kOfflineSdPhotoMode) {
+  if (frame.fb != &frame.ownedFb) {
     saveFrameAsJpeg(fb, kPhotoPath);
   }
   const uint32_t elapsed = millis() - start;
   releaseAnalysisFrame(frame);
 
-  Serial.printf("[CV] Periodic done in %u ms  source=%s  frame=%dx%d\n", elapsed, currentAnalysisSourceName(), frameWidth, frameHeight);
+  Serial.printf("[CV] Periodic done in %u ms  source=%s  mode=%s  frame=%dx%d\n",
+    elapsed, currentAnalysisSourceName(), analysisInputModeName(gAnalysisInputMode), frameWidth, frameHeight);
   for (uint8_t i = 0; i < kGaugeCount; ++i) {
     const GaugeReading &r = readings[i];
     const GaugeConfig  &g = config.gauges[i];

@@ -24,24 +24,28 @@ Implemented features:
 - Web Logs tab (view + clear)
 - Modbus TCP with 16 holding registers
 - `fault_code` and `analysis_source` in Modbus
-- offline SD mode (`/latest.jpg`, camera init skipped)
+- runtime-selectable analysis input source (`auto` / `camera` / `sd_photo`)
 - JPEG upload from Web UI to `/latest.jpg`
 - analysis decision debug fields in JSON (reason for selected/rejected angle)
 
 ## Image Source Modes
 
-The firmware supports 3 practical image source scenarios:
+The firmware supports 3 practical image source scenarios in one firmware build:
 
-1. Live camera mode
-- target production mode after camera hardware is repaired
+1. `auto`
+- preferred mode for normal operation
+- uses live camera when available
+- falls back to `/latest.jpg` on SD if camera is unavailable
 
-2. SD file mode (`/latest.jpg`)
-- active fallback/offline mode
-- does not require camera
+2. `camera`
+- forces live camera input only
+- useful when validating behavior on repaired hardware
 
-3. Web upload mode
-- uploaded JPEG is saved as `/latest.jpg`
-- analysis then works like SD source mode
+3. `sd_photo`
+- forces analysis from `/latest.jpg`
+- best mode for debugging with test images uploaded from a computer
+
+JPEG uploaded from the Web UI is always saved as `/latest.jpg`.
 
 ## HTTP API
 
@@ -63,6 +67,7 @@ Main endpoints:
 ```json
 {
   "status": "ok",
+  "analysis_input_mode": "auto",
   "source": "sd_photo",
   "gauges": [
     {
@@ -101,12 +106,22 @@ The Modbus tab includes:
 - register map descriptions
 - decoded `status` / `fault_code` / `analysis_source`
 
+In device settings, the UI now includes `analysis_input_source` selector:
+
+- `auto`
+- `camera`
+- `sd_photo`
+
+The selected mode is stored in `/config/config.json` and restored after reboot.
+
 ## Quick Start
 
 1. Fill in `include/secrets.h`.
 2. Flash the firmware.
-3. Insert SD card and prepare `/latest.jpg` (or upload through Web UI).
-4. Open the Web UI and run analysis.
+3. Insert SD card.
+4. Open the Web UI and choose analysis input mode (`auto` is recommended).
+5. If needed, upload a JPEG test image (saved as `/latest.jpg`).
+6. Run analysis.
 
 ## Notes
 
