@@ -1,40 +1,44 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <FS.h>
-#include <SD_MMC.h>
+#include <Preferences.h>
 #include <ctype.h>
 #include <math.h>
+#include <time.h>
 #include "esp_camera.h"
 #include "img_converters.h"
+#include "esp_heap_caps.h"
+#include "esp_chip_info.h"
 #include "secrets.h"
 
-// AI Thinker ESP32-CAM pin map
-#define PWDN_GPIO_NUM 32
+// Camera pin map for ESP32-S3 board with OV3660.
+// This matches the common ESP32-S3-EYE wiring used by many S3+OV3660 modules.
+#define PWDN_GPIO_NUM -1
 #define RESET_GPIO_NUM -1
-#define XCLK_GPIO_NUM 0
-#define SIOD_GPIO_NUM 26
-#define SIOC_GPIO_NUM 27
+#define XCLK_GPIO_NUM 15
+#define SIOD_GPIO_NUM 4
+#define SIOC_GPIO_NUM 5
 
-#define Y9_GPIO_NUM 35
-#define Y8_GPIO_NUM 34
-#define Y7_GPIO_NUM 39
-#define Y6_GPIO_NUM 36
-#define Y5_GPIO_NUM 21
-#define Y4_GPIO_NUM 19
-#define Y3_GPIO_NUM 18
-#define Y2_GPIO_NUM 5
-#define VSYNC_GPIO_NUM 25
-#define HREF_GPIO_NUM 23
-#define PCLK_GPIO_NUM 22
-#define FLASH_LED_GPIO_NUM 4
+#define Y9_GPIO_NUM 16
+#define Y8_GPIO_NUM 17
+#define Y7_GPIO_NUM 18
+#define Y6_GPIO_NUM 12
+#define Y5_GPIO_NUM 10
+#define Y4_GPIO_NUM 8
+#define Y3_GPIO_NUM 9
+#define Y2_GPIO_NUM 11
+#define VSYNC_GPIO_NUM 6
+#define HREF_GPIO_NUM 7
+#define PCLK_GPIO_NUM 13
+
+// Set to -1 when board has no dedicated flash LED GPIO.
+#define FLASH_LED_GPIO_NUM -1
 
 static const uint16_t kFlashWarmupMs = 70;
 static bool gFlashEnabled = true;
 static uint32_t gAnalysisIntervalMs = 60000;
 static const uint32_t kMinAnalysisIntervalMs = 10000;
 static const uint32_t kMaxAnalysisIntervalMs = 3600000;
-static bool gStorageReady = false;
 static bool gCameraReady = false;
 static bool gEmergencyMode = false;
 
@@ -67,37 +71,63 @@ static EmergencyBlinkState gEmergencyBlinkState = EmergencyBlinkState::Idle;
 static uint32_t gEmergencyBlinkStateMs = 0;
 static uint32_t gEmergencyNextBlinkMs = 0;
 
-static const char *kPhotoPath = "/latest.jpg";
-static const char *kConfigPath = "/config/config.json";
-static const char *kLogDir = "/logs";
-static const char *kLogPath = "/logs/system.log";
-static const size_t kWebLogTailBytes = 8192;
-static uint8_t gJpegWorkBuffer[3100];
 static const uint8_t kGaugeCount = 2;
-static File gUploadFile;
+
+// In-memory photo buffer (PSRAM)
+static uint8_t *gPhotoJpeg = nullptr;
+static size_t gPhotoJpegLen = 0;
+
+// In-memory log buffer
+static String gLogBuffer;
+static const size_t kLogMaxLen = 4096;
+
+// Upload accumulation buffer
+static uint8_t *gUploadBuf = nullptr;
+static size_t gUploadLen = 0;
+
+// Persistent config via NVS
+static Preferences gPrefs;
 static const float kAngleSearchMarginDeg = 8.0f;
+static bool gFlipHorizontal = false;
+static bool gFlipVertical = false;
 
 enum class AnalysisInputMode : uint8_t {
   Auto = 0,
   Camera = 1,
-  SdPhoto = 2
+  MemPhoto = 2
 };
 
 enum class AnalysisSourceCode : uint16_t {
   Unavailable = 0,
   CameraLive = 1,
-  SdPhoto = 2
+  MemPhoto = 2
 };
 
 static AnalysisInputMode gAnalysisInputMode = AnalysisInputMode::Auto;
 static AnalysisSourceCode gLastAnalysisSource = AnalysisSourceCode::Unavailable;
+static String gCameraResolutionSetting = "auto";
+static int gJpegQualitySetting = 15;
+
+static void *allocImageBuffer(size_t size) {
+  // Prefer PSRAM for large image buffers; fallback to internal RAM when needed.
+  void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!ptr) ptr = malloc(size);
+  return ptr;
+}
+
+static void *reallocImageBuffer(void *ptr, size_t size) {
+  // Keep upload/image data in PSRAM when available.
+  void *newPtr = heap_caps_realloc(ptr, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!newPtr) newPtr = realloc(ptr, size);
+  return newPtr;
+}
 
 const char *analysisInputModeName(AnalysisInputMode mode) {
   switch (mode) {
     case AnalysisInputMode::Camera:
       return "camera";
-    case AnalysisInputMode::SdPhoto:
-      return "sd_photo";
+    case AnalysisInputMode::MemPhoto:
+      return "mem_photo";
     case AnalysisInputMode::Auto:
     default:
       return "auto";
@@ -109,8 +139,8 @@ bool parseAnalysisInputMode(const String &value, AnalysisInputMode &mode) {
     mode = AnalysisInputMode::Camera;
     return true;
   }
-  if (value == "sd_photo" || value == "sd") {
-    mode = AnalysisInputMode::SdPhoto;
+  if (value == "mem_photo" || value == "sd_photo" || value == "sd") {
+    mode = AnalysisInputMode::MemPhoto;
     return true;
   }
   if (value == "auto") {
@@ -118,6 +148,23 @@ bool parseAnalysisInputMode(const String &value, AnalysisInputMode &mode) {
     return true;
   }
   return false;
+}
+
+bool parseCameraResolution(const String &value, framesize_t &frameSize) {
+  if (value == "qvga") { frameSize = FRAMESIZE_QVGA; return true; }
+  if (value == "vga") { frameSize = FRAMESIZE_VGA; return true; }
+  if (value == "svga") { frameSize = FRAMESIZE_SVGA; return true; }
+  if (value == "xga") { frameSize = FRAMESIZE_XGA; return true; }
+  if (value == "sxga") { frameSize = FRAMESIZE_SXGA; return true; }
+  if (value == "uxga") { frameSize = FRAMESIZE_UXGA; return true; }
+  if (value == "qxga") { frameSize = FRAMESIZE_QXGA; return true; }
+  return false;
+}
+
+bool isValidCameraResolutionSetting(const String &value) {
+  if (value == "auto") return true;
+  framesize_t ignored;
+  return parseCameraResolution(value, ignored);
 }
 
 struct GaugeConfig {
@@ -139,9 +186,13 @@ struct GaugeConfig {
 };
 
 struct DeviceConfig {
-  String deviceId = "esp32cam-01";
+  String deviceId = "esp32s3cam-01";
   int intervalS = 60;
   bool flashEnabled = true;
+  bool flipHorizontal = false;
+  bool flipVertical = false;
+  String cameraResolution = "auto";
+  int jpegQuality = 15;
   String analysisInputSource = "auto";
   GaugeConfig gauges[kGaugeCount];
   bool loaded = false;
@@ -228,7 +279,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <html><head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>ESP32-CAM Manometry</title>
+<title>ESP32-CAM Manometer</title>
 <style>
 *{box-sizing:border-box}
 body{font-family:sans-serif;margin:0;background:#f1f5f9;color:#1e293b}
@@ -266,134 +317,163 @@ select,input[type=color]{width:100%;border:1px solid #cbd5e1;border-radius:6px;p
 </head><body>
 
 <div class="top">
-  <h1>&#128247; ESP32-CAM Manometry</h1>
+  <h1>&#128247; ESP32-CAM Manometer</h1>
   <nav>
-    <button class="active" onclick="tab('cam',this)">Kamera</button>
-    <button onclick="tab('roi',this)">Kalibracja ROI</button>
+    <button class="active" onclick="tab('cam',this)">Camera</button>
+    <button onclick="tab('roi',this)">ROI Calibration</button>
+    <button onclick="tab('cfg',this)">Configuration</button>
     <button onclick="tab('modbus',this)">Modbus</button>
-    <button onclick="tab('logs',this)">Logi</button>
+    <button onclick="tab('logs',this)">Logs</button>
   </nav>
 </div>
 
 <div id="tab-cam" class="page active">
   <div class="card">
     <div class="row">
-      <button onclick="capture()">&#128247; Zrob zdjecie / odswiez SD</button>
-      <button class="grn" onclick="analyzeCapture()">&#129504; Analizuj obraz</button>
-      <button class="sec" onclick="reloadCam()">&#8635; Odswiez</button>
+      <button onclick="capture()">&#128247; Capture photo / refresh memory</button>
+      <button class="grn" onclick="analyzeCapture()">&#129504; Analyze image</button>
+      <button class="sec" onclick="reloadCam()">&#8635; Refresh</button>
       <input type="file" id="upload-input" accept=".jpg,.jpeg,image/jpeg" style="display:none" onchange="uploadPhoto(this)">
-      <button class="sec" onclick="document.getElementById('upload-input').click()">&#128228; Upload zdjecia</button>
+      <button class="sec" onclick="document.getElementById('upload-input').click()">&#128228; Upload photo</button>
     </div>
     <canvas id="canvas"></canvas>
     <p id="img-info" class="imginfo"></p>
     <div class="analysis">
-      <h3 style="margin:0 0 .5rem">Wynik analizy</h3>
-      <pre id="analysis-pre">Brak analizy</pre>
+      <h3 style="margin:0 0 .5rem">Analysis result</h3>
+      <pre id="analysis-pre">No analysis yet</pre>
     </div>
   </div>
 </div>
 
 <div id="tab-roi" class="page">
   <div class="card">
-    <p class="hint">Kliknij przycisk trybu przy manometrze, a nastepnie kliknij na obrazie, by ustawic srodek wskazowki.</p>
+    <p class="hint">Click the gauge mode button, then click the image to set the pointer center.</p>
     <div class="row">
-      <button onclick="captureAndSwitch()">&#128247; Wczytaj zdjecie z SD</button>
-      <button class="grn" onclick="saveConfig()">&#128190; Zapisz config na SD</button>
-      <button class="sec" onclick="loadConfig()">&#128194; Wczytaj z SD</button>
+      <button onclick="captureAndSwitch()">&#128247; Load photo</button>
+      <button class="grn" onclick="saveConfig()">&#128190; Save config</button>
+      <button class="sec" onclick="loadConfig()">&#128194; Load config</button>
     </div>
     <canvas id="canvas-roi"></canvas>
     <p id="roi-info" class="imginfo"></p>
   </div>
   <div class="gg">
     <div class="gc g1">
-      <h3 style="color:#e11d48">&#9899; Manometr 1</h3>
-      <button class="mode-btn" id="mb1" onclick="setMode(1)">&#127919; Ustaw srodek M1 (kliknij na obrazie)</button>
-      <label>Nazwa</label><input type="text" id="g1-name" value="Manometr 1">
-      <label>Srodek X (px)</label><input type="number" id="g1-cx" value="160" oninput="redraw()">
-      <label>Srodek Y (px)</label><input type="number" id="g1-cy" value="120" oninput="redraw()">
-      <label>Promien wskazowki (px)</label><input type="number" id="g1-r" value="80" oninput="redraw()">
-      <label>Kat MIN (deg, od gory, CW) np -135 = godz 7</label><input type="number" id="g1-amin" value="-135" oninput="redraw()">
-      <label>Kat MAX (deg, od gory, CW) np 135 = godz 5</label><input type="number" id="g1-amax" value="135" oninput="redraw()">
-      <label>Wartosc MIN</label><input type="number" id="g1-vmin" value="0">
-      <label>Wartosc MAX</label><input type="number" id="g1-vmax" value="10">
-      <label>Jednostka</label><input type="text" id="g1-unit" value="bar">
+      <h3 style="color:#e11d48">&#9899; Gauge 1</h3>
+      <button class="mode-btn" id="mb1" onclick="setMode(1)">&#127919; Set G1 center (click on image)</button>
+      <label>Name</label><input type="text" id="g1-name" value="Gauge 1">
+      <label>Center X (px)</label><input type="number" id="g1-cx" value="160" oninput="redraw()">
+      <label>Center Y (px)</label><input type="number" id="g1-cy" value="120" oninput="redraw()">
+      <label>Needle radius (px)</label><input type="number" id="g1-r" value="80" oninput="redraw()">
+      <label>Angle MIN (deg, from top, CW) e.g. -135 = 7 o'clock</label><input type="number" id="g1-amin" value="-135" oninput="redraw()">
+      <label>Angle MAX (deg, from top, CW) e.g. 135 = 5 o'clock</label><input type="number" id="g1-amax" value="135" oninput="redraw()">
+      <label>Value MIN</label><input type="number" id="g1-vmin" value="0">
+      <label>Value MAX</label><input type="number" id="g1-vmax" value="10">
+      <label>Unit</label><input type="text" id="g1-unit" value="bar">
       <div class="cfg-ana">
-        <label>Tryb analizy M1</label>
+        <label>Analysis mode G1</label>
         <select id="g1-analysis-mode" onchange="onGaugeAnalysisModeChanged(1);updatePreview();">
-          <option value="classic_darkness">Klasyczna (najciemniejsza wskazowka)</option>
-          <option value="color_target">Kolorowa (wskazany kolor wskazowki)</option>
-          <option value="hybrid_pca_hough">Hybrydowa (PCA blob + mini-Hough)</option>
+          <option value="classic_darkness">Classic (darkest needle)</option>
+          <option value="color_target">Color target (selected needle color)</option>
+          <option value="hybrid_pca_hough">Hybrid (PCA blob + mini-Hough)</option>
         </select>
         <div id="g1-color-settings" class="cfg-ana-grid">
           <div>
-            <label>Kolor wskazowki</label>
+            <label>Needle color</label>
             <input type="color" id="g1-needle-color" value="#d00000" oninput="updatePreview()">
           </div>
           <div>
-            <label>Kolor tla tarczy</label>
+            <label>Dial background color</label>
             <input type="color" id="g1-background-color" value="#7f7f7f" oninput="updatePreview()">
           </div>
           <div>
-            <label>Kolor cyfr/napisow</label>
+            <label>Digits/text color</label>
             <input type="color" id="g1-text-color" value="#101010" oninput="updatePreview()">
           </div>
         </div>
       </div>
     </div>
     <div class="gc g2">
-      <h3 style="color:#2563eb">&#9899; Manometr 2</h3>
-      <button class="mode-btn" id="mb2" onclick="setMode(2)">&#127919; Ustaw srodek M2 (kliknij na obrazie)</button>
-      <label>Nazwa</label><input type="text" id="g2-name" value="Manometr 2">
-      <label>Srodek X (px)</label><input type="number" id="g2-cx" value="480" oninput="redraw()">
-      <label>Srodek Y (px)</label><input type="number" id="g2-cy" value="120" oninput="redraw()">
-      <label>Promien wskazowki (px)</label><input type="number" id="g2-r" value="80" oninput="redraw()">
-      <label>Kat MIN (deg, od gory, CW)</label><input type="number" id="g2-amin" value="-135" oninput="redraw()">
-      <label>Kat MAX (deg, od gory, CW)</label><input type="number" id="g2-amax" value="135" oninput="redraw()">
-      <label>Wartosc MIN</label><input type="number" id="g2-vmin" value="0">
-      <label>Wartosc MAX</label><input type="number" id="g2-vmax" value="10">
-      <label>Jednostka</label><input type="text" id="g2-unit" value="bar">
+      <h3 style="color:#2563eb">&#9899; Gauge 2</h3>
+      <button class="mode-btn" id="mb2" onclick="setMode(2)">&#127919; Set G2 center (click on image)</button>
+      <label>Name</label><input type="text" id="g2-name" value="Gauge 2">
+      <label>Center X (px)</label><input type="number" id="g2-cx" value="480" oninput="redraw()">
+      <label>Center Y (px)</label><input type="number" id="g2-cy" value="120" oninput="redraw()">
+      <label>Needle radius (px)</label><input type="number" id="g2-r" value="80" oninput="redraw()">
+      <label>Angle MIN (deg, from top, CW)</label><input type="number" id="g2-amin" value="-135" oninput="redraw()">
+      <label>Angle MAX (deg, from top, CW)</label><input type="number" id="g2-amax" value="135" oninput="redraw()">
+      <label>Value MIN</label><input type="number" id="g2-vmin" value="0">
+      <label>Value MAX</label><input type="number" id="g2-vmax" value="10">
+      <label>Unit</label><input type="text" id="g2-unit" value="bar">
       <div class="cfg-ana">
-        <label>Tryb analizy M2</label>
+        <label>Analysis mode G2</label>
         <select id="g2-analysis-mode" onchange="onGaugeAnalysisModeChanged(2);updatePreview();">
-          <option value="classic_darkness">Klasyczna (najciemniejsza wskazowka)</option>
-          <option value="color_target">Kolorowa (wskazany kolor wskazowki)</option>
-          <option value="hybrid_pca_hough">Hybrydowa (PCA blob + mini-Hough)</option>
+          <option value="classic_darkness">Classic (darkest needle)</option>
+          <option value="color_target">Color target (selected needle color)</option>
+          <option value="hybrid_pca_hough">Hybrid (PCA blob + mini-Hough)</option>
         </select>
         <div id="g2-color-settings" class="cfg-ana-grid">
           <div>
-            <label>Kolor wskazowki</label>
+            <label>Needle color</label>
             <input type="color" id="g2-needle-color" value="#d00000" oninput="updatePreview()">
           </div>
           <div>
-            <label>Kolor tla tarczy</label>
+            <label>Dial background color</label>
             <input type="color" id="g2-background-color" value="#7f7f7f" oninput="updatePreview()">
           </div>
           <div>
-            <label>Kolor cyfr/napisow</label>
+            <label>Digits/text color</label>
             <input type="color" id="g2-text-color" value="#101010" oninput="updatePreview()">
           </div>
         </div>
       </div>
     </div>
   </div>
-  <div class="card" style="margin-top:1rem">
+</div>
+
+<div id="tab-cfg" class="page">
+  <div class="card">
+    <div class="row" style="margin-bottom:.5rem">
+      <button class="grn" onclick="saveConfig()">&#128190; Save configuration</button>
+      <button class="sec" onclick="loadConfig()">&#128194; Load configuration</button>
+    </div>
     <div class="cfg-ana">
-      <h3 style="margin:0 0 .5rem">Ustawienia urzadzenia</h3>
+      <h3 style="margin:0 0 .5rem">Device settings</h3>
       <label style="display:flex;align-items:center;gap:.5rem;color:#1e293b;margin:.2rem 0 .6rem">
         <input type="checkbox" id="flash-enabled" checked onchange="updatePreview()">
-        Uzyj diody flash podczas robienia zdjecia
+        Use flash LED while capturing photo
       </label>
-      <label>Zrodlo analizy obrazu</label>
-      <select id="analysis-input-source" onchange="updatePreview()">
-        <option value="auto">Auto (kamera, a przy bledzie SD)</option>
-        <option value="camera">Tylko kamera live</option>
-        <option value="sd_photo">Tylko plik SD (/latest.jpg)</option>
+      <label style="display:flex;align-items:center;gap:.5rem;color:#1e293b;margin:.2rem 0 .6rem">
+        <input type="checkbox" id="flip-horizontal" onchange="onFlipChanged()">
+        Flip image horizontally before analysis
+      </label>
+      <label style="display:flex;align-items:center;gap:.5rem;color:#1e293b;margin:.2rem 0 .6rem">
+        <input type="checkbox" id="flip-vertical" onchange="onFlipChanged()">
+        Flip image vertically before analysis
+      </label>
+      <label>Camera resolution</label>
+      <select id="camera-resolution" onchange="updatePreview()">
+        <option value="auto">Auto (keep initial)</option>
+        <option value="qvga">QVGA 320x240</option>
+        <option value="vga">VGA 640x480</option>
+        <option value="svga">SVGA 800x600</option>
+        <option value="xga">XGA 1024x768</option>
+        <option value="sxga">SXGA 1280x1024</option>
+        <option value="uxga">UXGA 1600x1200</option>
+        <option value="qxga">QXGA 2048x1536</option>
       </select>
-      <label>Czas pomiedzy automatycznym zdjeciem i analiza (sekundy)</label>
+      <label>JPEG quality (10..63, lower = better quality)</label>
+      <input type="number" id="jpeg-quality" min="10" max="63" value="15" oninput="updatePreview()">
+      <label>Analysis input source</label>
+      <select id="analysis-input-source" onchange="updatePreview()">
+        <option value="auto">Auto (camera, fallback to memory)</option>
+        <option value="camera">Live camera only</option>
+        <option value="mem_photo">Memory photo only</option>
+      </select>
+      <label>Time between automatic capture and analysis (seconds)</label>
       <input type="number" id="auto-interval-s" min="10" max="3600" value="60" oninput="updatePreview()">
-      <p class="hint" style="margin-top:.4rem">Zakres: 10..3600 s</p>
+      <p class="hint" style="margin-top:.4rem">Range: 10..3600 s</p>
     </div>
-    <h3 style="margin:0 0 .5rem">config.json (podglad)</h3>
+    <h3 style="margin:1rem 0 .5rem">config.json (preview)</h3>
     <pre id="cfg-pre">{}</pre>
   </div>
 </div>
@@ -401,27 +481,27 @@ select,input[type=color]{width:100%;border:1px solid #cbd5e1;border-radius:6px;p
 <div id="tab-modbus" class="page">
   <div class="card">
     <div class="row">
-      <button class="sec" onclick="loadModbusStatus()">&#8635; Odswiez status Modbus</button>
+      <button class="sec" onclick="loadModbusStatus()">&#8635; Refresh Modbus status</button>
     </div>
-    <h3 style="margin:0 0 .5rem">Parametry polaczenia</h3>
-    <pre id="modbus-conn">Ladowanie...</pre>
-    <h3 style="margin:1rem 0 .5rem">Stan urzadzenia</h3>
-    <pre id="modbus-state">Ladowanie...</pre>
-    <h3 style="margin:1rem 0 .5rem">Rejestry holding (0..15)</h3>
-    <pre id="modbus-regs">Ladowanie...</pre>
-    <h3 style="margin:1rem 0 .5rem">Opis rejestrow i kody</h3>
-    <pre id="modbus-help">Ladowanie...</pre>
+    <h3 style="margin:0 0 .5rem">Connection parameters</h3>
+    <pre id="modbus-conn">Loading...</pre>
+    <h3 style="margin:1rem 0 .5rem">Device status</h3>
+    <pre id="modbus-state">Loading...</pre>
+    <h3 style="margin:1rem 0 .5rem">Holding registers (0..15)</h3>
+    <pre id="modbus-regs">Loading...</pre>
+    <h3 style="margin:1rem 0 .5rem">Register descriptions and codes</h3>
+    <pre id="modbus-help">Loading...</pre>
   </div>
 </div>
 
 <div id="tab-logs" class="page">
   <div class="card">
     <div class="row">
-      <button class="sec" onclick="loadLogs()">&#8635; Odswiez log</button>
-      <button onclick="clearLogs()">Wyczysc log</button>
+      <button class="sec" onclick="loadLogs()">&#8635; Refresh log</button>
+      <button onclick="clearLogs()">Clear log</button>
     </div>
-    <p class="hint">Pokazywane sa ostatnie wpisy z pliku /logs/system.log.</p>
-    <pre id="logs-pre">Ladowanie...</pre>
+    <p class="hint">Showing latest in-memory log entries (up to 4KB).</p>
+    <pre id="logs-pre">Loading...</pre>
   </div>
 </div>
 
@@ -433,7 +513,38 @@ const canvas=document.getElementById('canvas');
 const ctx=canvas.getContext('2d');
 const cRoi=document.getElementById('canvas-roi');
 const rctx=cRoi.getContext('2d');
+let camImg=null;
 let roiImg=null;
+
+function getFlipSettings(){
+  return {
+    h: !!(document.getElementById('flip-horizontal') && document.getElementById('flip-horizontal').checked),
+    v: !!(document.getElementById('flip-vertical') && document.getElementById('flip-vertical').checked)
+  };
+}
+
+function drawImageWithFlip(targetCtx,img,w,h,flipH,flipV){
+  targetCtx.save();
+  if(flipH||flipV){
+    targetCtx.translate(flipH?w:0,flipV?h:0);
+    targetCtx.scale(flipH?-1:1,flipV?-1:1);
+  }
+  targetCtx.drawImage(img,0,0,w,h);
+  targetCtx.restore();
+}
+
+function drawCamCanvas(){
+  if(!camImg)return;
+  const f=getFlipSettings();
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  drawImageWithFlip(ctx,camImg,canvas.width,canvas.height,f.h,f.v);
+}
+
+function onFlipChanged(){
+  updatePreview();
+  drawCamCanvas();
+  if(roiImg)redraw();
+}
 
 function tab(id,btn){
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
@@ -442,22 +553,23 @@ function tab(id,btn){
   btn.classList.add('active');
   if(modbusTimer){clearInterval(modbusTimer);modbusTimer=null;}
   if(id==='roi'){loadRoiImg();updatePreview();}
+  if(id==='cfg'){updatePreview();}
   if(id==='modbus'){loadModbusStatus();modbusTimer=setInterval(loadModbusStatus,2000);}
   if(id==='logs'){loadLogs();}
 }
 
 function loadCamImg(){
   const info=document.getElementById('img-info');
-  info.textContent='Ladowanie...';
+  info.textContent='Loading...';
   const i=new Image();
-  i.onload=()=>{canvas.width=i.width;canvas.height=i.height;ctx.drawImage(i,0,0);info.textContent=i.width+'x'+i.height+' px';};
+  i.onload=()=>{camImg=i;canvas.width=i.width;canvas.height=i.height;drawCamCanvas();info.textContent=i.width+'x'+i.height+' px';};
   i.src='/photo.jpg?t='+Date.now();
 }
 function reloadCam(){loadCamImg();}
 
 function loadRoiImg(){
   const info=document.getElementById('roi-info');
-  info.textContent='Ladowanie...';
+  info.textContent='Loading...';
   const i=new Image();
   i.onload=()=>{cRoi.width=i.width;cRoi.height=i.height;roiImg=i;redraw();info.textContent=i.width+'x'+i.height+' px';};
   i.src='/photo.jpg?t='+Date.now();
@@ -465,33 +577,33 @@ function loadRoiImg(){
 
 async function capture(){
   const r=await fetch('/capture',{method:'POST'});
-  if(!r.ok){alert('Blad capture');return;}
+  if(!r.ok){alert('Capture error');return;}
   loadCamImg();
 }
 async function captureAndSwitch(){
   const r=await fetch('/capture',{method:'POST'});
-  if(!r.ok){alert('Blad capture');return;}
+  if(!r.ok){alert('Capture error');return;}
   loadRoiImg();
 }
 
 async function uploadPhoto(input){
   if(!input.files||!input.files[0])return;
   const info=document.getElementById('img-info');
-  info.textContent='Wysylanie...';
+  info.textContent='Uploading...';
   const fd=new FormData();
   fd.append('photo',input.files[0],'photo.jpg');
   const r=await fetch('/upload',{method:'POST',body:fd});
   input.value='';
-  if(!r.ok){info.textContent='Blad uploadu: '+(await r.text());return;}
+  if(!r.ok){info.textContent='Upload error: '+(await r.text());return;}
   loadCamImg();
 }
 
 async function analyzeCapture(){
   const out=document.getElementById('analysis-pre');
-  out.textContent='Analiza w toku...';
+  out.textContent='Analysis in progress...';
   const r=await fetch('/analyze',{method:'POST'});
   const text=await r.text();
-  if(!r.ok){out.textContent=text||'Blad analizy';return;}
+  if(!r.ok){out.textContent=text||'Analysis error';return;}
   try{out.textContent=JSON.stringify(JSON.parse(text),null,2);}catch{out.textContent=text;}
   loadCamImg();
 }
@@ -505,8 +617,9 @@ function getG(n){
 
 function redraw(){
   if(!roiImg)return;
+  const f=getFlipSettings();
   rctx.clearRect(0,0,cRoi.width,cRoi.height);
-  rctx.drawImage(roiImg,0,0,cRoi.width,cRoi.height);
+  drawImageWithFlip(rctx,roiImg,cRoi.width,cRoi.height,f.h,f.v);
   [1,2].forEach(n=>{
     const g=getG(n),col=COLORS[n];
     const aMin=d2r(g.amin),aMax=d2r(g.amax);
@@ -547,10 +660,17 @@ cRoi.addEventListener('click',ev=>{
 function buildConfig(){
   const autoInterval=Math.max(10,Math.min(3600,gv('auto-interval-s')||60));
   const sourceEl=document.getElementById('analysis-input-source');
+  const resolutionEl=document.getElementById('camera-resolution');
+  const jpegQualityEl=document.getElementById('jpeg-quality');
+  const jpegQuality=Math.max(10,Math.min(63,(jpegQualityEl?(+jpegQualityEl.value):15)||15));
   return{
-    device_id:'esp32cam-01',
+    device_id:'esp32s3cam-01',
     interval_s:autoInterval,
     flash_enabled:!!document.getElementById('flash-enabled').checked,
+    flip_horizontal:!!document.getElementById('flip-horizontal').checked,
+    flip_vertical:!!document.getElementById('flip-vertical').checked,
+    camera_resolution:resolutionEl?resolutionEl.value:'auto',
+    jpeg_quality:jpegQuality,
     analysis_input_source:sourceEl?sourceEl.value:'auto',
     gauges:[1,2].map(n=>{
       const p='g'+n;
@@ -570,9 +690,17 @@ function buildConfig(){
 function applyConfig(cfg){
   if(!cfg||!Array.isArray(cfg.gauges))return;
   const flashEl=document.getElementById('flash-enabled');
+  const flipHEl=document.getElementById('flip-horizontal');
+  const flipVEl=document.getElementById('flip-vertical');
+  const resolutionEl=document.getElementById('camera-resolution');
+  const jpegQualityEl=document.getElementById('jpeg-quality');
   const intervalEl=document.getElementById('auto-interval-s');
   const sourceEl=document.getElementById('analysis-input-source');
   if(flashEl)flashEl.checked=(cfg.flash_enabled!==false);
+  if(flipHEl)flipHEl.checked=(cfg.flip_horizontal===true);
+  if(flipVEl)flipVEl.checked=(cfg.flip_vertical===true);
+  if(resolutionEl)resolutionEl.value=(cfg.camera_resolution||'auto');
+  if(jpegQualityEl)jpegQualityEl.value=Math.max(10,Math.min(63,(+cfg.jpeg_quality)||15));
   if(intervalEl)intervalEl.value=Math.max(10,Math.min(3600,(+cfg.interval_s)||60));
   if(sourceEl)sourceEl.value=(cfg.analysis_input_source||'auto');
   cfg.gauges.forEach(g=>{
@@ -587,6 +715,7 @@ function applyConfig(cfg){
     s(p+'-text-color',g.text_color||cfg.text_color||'#101010');
     onGaugeAnalysisModeChanged(n);
   });
+  drawCamCanvas();
   redraw();
 }
 
@@ -602,8 +731,8 @@ function updatePreview(){
 
 async function saveConfig(){
   const r=await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(buildConfig())});
-  if(!r.ok){alert('Blad zapisu konfiguracji');return;}
-  alert('Konfiguracja zapisana na SD (/config/config.json)');
+  if(!r.ok){alert('Configuration save error');return;}
+  alert('Configuration saved');
 }
 
 async function loadConfig(){
@@ -613,7 +742,7 @@ async function loadConfig(){
 }
 
 function renderModbusRegisters(registers){
-  if(!Array.isArray(registers)||!registers.length)return 'Brak danych';
+  if(!Array.isArray(registers)||!registers.length)return 'No data';
   const descByAddr={
     0:'status',
     1:'g1_x100',
@@ -647,17 +776,17 @@ function decodeStatusCode(code){
 }
 
 function decodeFaultCode(code){
-  if(code===0)return '0: brak bledow';
+  if(code===0)return '0: no errors';
   const parts=[];
   if(code&0x01)parts.push('bit0=storage_not_ready');
   if(code&0x02)parts.push('bit1=camera_not_ready');
-  return code+': '+(parts.length?parts.join(', '):'nieznany kod');
+  return code+': '+(parts.length?parts.join(', '):'unknown code');
 }
 
 function decodeAnalysisSource(code){
   if(code===0)return '0: unavailable';
   if(code===1)return '1: camera_live';
-  if(code===2)return '2: sd_photo';
+  if(code===2)return '2: mem_photo';
   return code+': unknown';
 }
 
@@ -669,17 +798,17 @@ function renderModbusHelp(data){
   const i16=addr=>byAddr[addr]?byAddr[addr].i16:0;
 
   const lines=[];
-  lines.push('Mapa rejestrow (holding 4xxxx):');
+  lines.push('Register map (holding 4xxxx):');
   lines.push('40001 addr0  status        : '+u16(0)+' -> '+decodeStatusCode(u16(0)));
-  lines.push('40002 addr1  g1_x100       : '+i16(1)+' (wartosc M1 * 100)');
-  lines.push('40003 addr2  g2_x100       : '+i16(2)+' (wartosc M2 * 100)');
+  lines.push('40002 addr1  g1_x100       : '+i16(1)+' (value G1 * 100)');
+  lines.push('40003 addr2  g2_x100       : '+i16(2)+' (value G2 * 100)');
   lines.push('40004 addr3  diff_x100     : '+i16(3)+' (M1-M2)*100');
-  lines.push('40005 addr4  conf1_x1000   : '+u16(4)+' (pewnosc M1 0..1000)');
-  lines.push('40006 addr5  conf2_x1000   : '+u16(5)+' (pewnosc M2 0..1000)');
-  lines.push('40007 addr6  uptime_lo     : '+u16(6)+' (sekundy low word)');
-  lines.push('40008 addr7  uptime_hi     : '+u16(7)+' (sekundy high word)');
+  lines.push('40005 addr4  conf1_x1000   : '+u16(4)+' (confidence G1 0..1000)');
+  lines.push('40006 addr5  conf2_x1000   : '+u16(5)+' (confidence G2 0..1000)');
+  lines.push('40007 addr6  uptime_lo     : '+u16(6)+' (seconds low word)');
+  lines.push('40008 addr7  uptime_hi     : '+u16(7)+' (seconds high word)');
   lines.push('40009 addr8  wifi_rssi     : '+i16(8)+' dBm');
-  lines.push('40010 addr9  heartbeat     : '+u16(9)+' (licznik zycia)');
+  lines.push('40010 addr9  heartbeat     : '+u16(9)+' (heartbeat counter)');
   lines.push('40011 addr10 fault_code    : '+decodeFaultCode(u16(10)));
   lines.push('40012 addr11 analysis_src  : '+decodeAnalysisSource(u16(11)));
   lines.push('40013 addr12 reserved12    : '+u16(12));
@@ -687,11 +816,11 @@ function renderModbusHelp(data){
   lines.push('40015 addr14 reserved14    : '+u16(14));
   lines.push('40016 addr15 reserved15    : '+u16(15));
   lines.push('');
-  lines.push('Kody specjalne:');
-  lines.push('status: 0=ok, 11=brak M1, 12=brak M2, 13=brak obu');
-  lines.push('fault_code bitmask: bit0=storage, bit1=camera');
-  lines.push('analysis_source: 0=unavailable, 1=camera_live, 2=sd_photo');
-  lines.push('Brak pomiaru w rejestrach i16: -32768');
+  lines.push('Special codes:');
+  lines.push('status: 0=ok, 11=missing G1, 12=missing G2, 13=both missing');
+  lines.push('fault_code bitmask: bit1=camera');
+  lines.push('analysis_source: 0=unavailable, 1=camera_live, 2=mem_photo');
+  lines.push('No measurement in i16 registers: -32768');
   return lines.join('\n');
 }
 
@@ -704,39 +833,39 @@ async function loadModbusStatus(){
     const r=await fetch('/modbus/status');
     if(!r.ok){
       const t=await r.text();
-      conn.textContent='Blad odczytu: '+(t||r.status);
-      if(help)help.textContent='Brak danych';
+      conn.textContent='Read error: '+(t||r.status);
+      if(help)help.textContent='No data';
       return;
     }
     const data=await r.json();
     conn.textContent='IP: '+data.ip+'\nPort: '+data.port+'\nUnit ID: '+data.unit_id+'\nFunkcja: '+data.function;
-    state.textContent='WiFi: '+data.wifi_status+'\nRSSI: '+data.rssi_dbm+' dBm\nHeartbeat: '+data.heartbeat+'\nStatus: '+decodeStatusCode((data.registers&&data.registers[0])?data.registers[0].u16:0)+'\nFault: '+decodeFaultCode(data.fault_code||0)+'\nSource: '+decodeAnalysisSource((data.registers&&data.registers[11])?data.registers[11].u16:0)+'\nInput mode: '+(data.analysis_input_mode||'auto')+'\nCamera ready: '+(data.camera_ready?'yes':'no')+'\nStorage ready: '+(data.storage_ready?'yes':'no');
+    state.textContent='WiFi: '+data.wifi_status+'\nRSSI: '+data.rssi_dbm+' dBm\nHeartbeat: '+data.heartbeat+'\nStatus: '+decodeStatusCode((data.registers&&data.registers[0])?data.registers[0].u16:0)+'\nFault: '+decodeFaultCode(data.fault_code||0)+'\nSource: '+decodeAnalysisSource((data.registers&&data.registers[11])?data.registers[11].u16:0)+'\nInput mode: '+(data.analysis_input_mode||'auto')+'\nCamera ready: '+(data.camera_ready?'yes':'no');
     regs.textContent=renderModbusRegisters(data.registers);
     if(help)help.textContent=renderModbusHelp(data);
   }catch(e){
-    conn.textContent='Blad: '+e;
-    if(help)help.textContent='Blad: '+e;
+    conn.textContent='Error: '+e;
+    if(help)help.textContent='Error: '+e;
   }
 }
 
 async function loadLogs(){
   const out=document.getElementById('logs-pre');
-  out.textContent='Ladowanie...';
+  out.textContent='Loading...';
   try{
     const r=await fetch('/logs?t='+Date.now());
     const text=await r.text();
-    if(!r.ok){out.textContent='Blad odczytu logu: '+(text||r.status);return;}
-    out.textContent=text&&text.length?text:'Brak wpisow logu';
+    if(!r.ok){out.textContent='Log read error: '+(text||r.status);return;}
+    out.textContent=text&&text.length?text:'No log entries';
   }catch(e){
-    out.textContent='Blad: '+e;
+    out.textContent='Error: '+e;
   }
 }
 
 async function clearLogs(){
-  if(!confirm('Na pewno wyczyscic log?'))return;
+  if(!confirm('Are you sure you want to clear logs?'))return;
   const r=await fetch('/logs/clear',{method:'POST'});
   const text=await r.text();
-  if(!r.ok){alert('Blad kasowania logu: '+(text||r.status));return;}
+  if(!r.ok){alert('Log clear error: '+(text||r.status));return;}
   loadLogs();
 }
 
@@ -754,82 +883,15 @@ bool checkAuth() {
   return false;
 }
 
-String sdReadText(const char *path) {
-  File f = SD_MMC.open(path, FILE_READ);
-  if (!f) return String();
-
-  String text;
-  text.reserve(f.size() + 1);
-  while (f.available()) {
-    text += static_cast<char>(f.read());
-  }
-  f.close();
-  return text;
-}
-
-bool sdWriteBytes(const char *path, const uint8_t *data, size_t len) {
-  if (SD_MMC.exists(path) && !SD_MMC.remove(path)) return false;
-  File f = SD_MMC.open(path, FILE_WRITE);
-  if (!f) return false;
-  const size_t written = f.write(data, len);
-  f.close();
-  return written == len;
-}
-
-bool sdWriteText(const char *path, const String &text) {
-  if (SD_MMC.exists(path) && !SD_MMC.remove(path)) return false;
-  File f = SD_MMC.open(path, FILE_WRITE);
-  if (!f) return false;
-  const size_t written = f.print(text);
-  f.close();
-  return written == text.length();
-}
-
-bool sdEnsureDir(const char *dir) {
-  if (SD_MMC.exists(dir)) return true;
-  return SD_MMC.mkdir(dir);
-}
-
-String sdReadTextTail(const char *path, size_t maxBytes) {
-  File f = SD_MMC.open(path, FILE_READ);
-  if (!f) return String();
-
-  const size_t fileSize = f.size();
-  size_t startOffset = 0;
-  if (maxBytes > 0 && fileSize > maxBytes) {
-    startOffset = fileSize - maxBytes;
-  }
-
-  if (startOffset > 0 && !f.seek(startOffset)) {
-    f.close();
-    return String();
-  }
-
-  // Start at a whole line when serving the tail.
-  if (startOffset > 0) {
-    while (f.available()) {
-      if (f.read() == '\n') break;
-    }
-  }
-
-  String text;
-  text.reserve(maxBytes > 0 ? maxBytes + 32 : fileSize + 1);
-  while (f.available()) {
-    text += static_cast<char>(f.read());
-  }
-  f.close();
-  return text;
-}
-
 bool appendLogLine(const String &line) {
-  if (!gStorageReady) return false;
-  if (!sdEnsureDir(kLogDir)) return false;
-
-  File f = SD_MMC.open(kLogPath, FILE_APPEND);
-  if (!f) return false;
-  const size_t written = f.println(line);
-  f.close();
-  return written > 0;
+  const String entry = line + "\n";
+  while (gLogBuffer.length() + entry.length() > kLogMaxLen && gLogBuffer.length() > 0) {
+    const int nl = gLogBuffer.indexOf('\n');
+    if (nl < 0) { gLogBuffer = ""; break; }
+    gLogBuffer = gLogBuffer.substring(nl + 1);
+  }
+  gLogBuffer += entry;
+  return true;
 }
 
 void logEvent(const char *level, const String &message) {
@@ -846,6 +908,59 @@ void logEvent(const char *level, const String &message) {
 
 void logEvent(const char *level, const char *message) {
   logEvent(level, String(message ? message : ""));
+}
+
+int clampJpegQuality(int value) {
+  if (value < 10) return 10;
+  if (value > 63) return 63;
+  return value;
+}
+
+void applyCameraResolutionSetting(const String &requested) {
+  if (!isValidCameraResolutionSetting(requested)) return;
+  if (requested == gCameraResolutionSetting) return;
+
+  gCameraResolutionSetting = requested;
+  if (!gCameraReady) return;
+  if (requested == "auto") {
+    logEvent("CAM", "camera resolution mode set to auto");
+    return;
+  }
+
+  framesize_t target;
+  if (!parseCameraResolution(requested, target)) return;
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) {
+    logEvent("CAM", "sensor unavailable while applying resolution");
+    return;
+  }
+
+  if (s->set_framesize(s, target) == 0) {
+    logEvent("CAM", String("camera resolution applied: ") + requested);
+  } else {
+    logEvent("CAM", String("camera resolution apply failed: ") + requested);
+  }
+}
+
+void applyJpegQualitySetting(int requestedQuality) {
+  const int clamped = clampJpegQuality(requestedQuality);
+  if (clamped == gJpegQualitySetting) return;
+
+  gJpegQualitySetting = clamped;
+  if (!gCameraReady) return;
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) {
+    logEvent("CAM", "sensor unavailable while applying JPEG quality");
+    return;
+  }
+
+  if (s->set_quality(s, gJpegQualitySetting) == 0) {
+    logEvent("CAM", String("JPEG quality applied: ") + String(gJpegQualitySetting));
+  } else {
+    logEvent("CAM", String("JPEG quality apply failed: ") + String(gJpegQualitySetting));
+  }
 }
 
 String jsonEscape(const String &value) {
@@ -872,6 +987,43 @@ String hex4(uint16_t value) {
   char buf[5];
   snprintf(buf, sizeof(buf), "%04X", value);
   return String(buf);
+}
+
+bool parseJpegDimensions(const uint8_t *data, size_t len, uint16_t &width, uint16_t &height) {
+  if (!data || len < 4 || data[0] != 0xFF || data[1] != 0xD8) return false;
+
+  size_t offset = 2;
+  while (offset + 1 < len) {
+    while (offset < len && data[offset] == 0xFF) {
+      ++offset;
+    }
+    if (offset >= len) return false;
+
+    const uint8_t marker = data[offset++];
+    if (marker == 0xD9 || marker == 0xDA) return false;
+    if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
+    if (offset + 1 >= len) return false;
+
+    const uint16_t segmentLen = static_cast<uint16_t>((data[offset] << 8) | data[offset + 1]);
+    offset += 2;
+    if (segmentLen < 2 || offset + segmentLen - 2 > len) return false;
+
+    const bool isSofMarker =
+      (marker >= 0xC0 && marker <= 0xC3) ||
+      (marker >= 0xC5 && marker <= 0xC7) ||
+      (marker >= 0xC9 && marker <= 0xCB) ||
+      (marker >= 0xCD && marker <= 0xCF);
+    if (isSofMarker) {
+      if (segmentLen < 7) return false;
+      height = static_cast<uint16_t>((data[offset + 1] << 8) | data[offset + 2]);
+      width = static_cast<uint16_t>((data[offset + 3] << 8) | data[offset + 4]);
+      return width > 0 && height > 0;
+    }
+
+    offset += segmentLen - 2;
+  }
+
+  return false;
 }
 
 bool jsonExtractNumber(const String &source, const char *key, float &value) {
@@ -1019,14 +1171,17 @@ String formatHexColor(uint8_t r, uint8_t g, uint8_t b) {
 
 bool loadDeviceConfig(DeviceConfig &config) {
   config = DeviceConfig();
-  if (!SD_MMC.exists(kConfigPath)) return false;
-
-  const String json = sdReadText(kConfigPath);
+  if (!gPrefs.isKey("cfg")) return false;
+  const String json = gPrefs.getString("cfg", "");
   if (json.isEmpty()) return false;
 
   jsonExtractString(json, "device_id", config.deviceId);
   jsonExtractInt(json, "interval_s", config.intervalS);
   jsonExtractBool(json, "flash_enabled", config.flashEnabled);
+  jsonExtractBool(json, "flip_horizontal", config.flipHorizontal);
+  jsonExtractBool(json, "flip_vertical", config.flipVertical);
+  jsonExtractString(json, "camera_resolution", config.cameraResolution);
+  jsonExtractInt(json, "jpeg_quality", config.jpegQuality);
   jsonExtractString(json, "analysis_input_source", config.analysisInputSource);
 
   String legacyMode = "color_target";
@@ -1093,12 +1248,21 @@ bool loadDeviceConfig(DeviceConfig &config) {
     if (!config.gauges[i].valid) return false;
   }
 
+  if (!isValidCameraResolutionSetting(config.cameraResolution)) {
+    config.cameraResolution = "auto";
+  }
+  config.jpegQuality = clampJpegQuality(config.jpegQuality);
+
   config.loaded = true;
   return true;
 }
 
 void applyRuntimeSettings(const DeviceConfig &config) {
   gFlashEnabled = config.flashEnabled;
+  gFlipHorizontal = config.flipHorizontal;
+  gFlipVertical = config.flipVertical;
+  applyCameraResolutionSetting(config.cameraResolution);
+  applyJpegQualitySetting(config.jpegQuality);
 
   AnalysisInputMode parsedMode = AnalysisInputMode::Auto;
   if (parseAnalysisInputMode(config.analysisInputSource, parsedMode)) {
@@ -1113,22 +1277,98 @@ void applyRuntimeSettings(const DeviceConfig &config) {
   gAnalysisIntervalMs = static_cast<uint32_t>(intervalS) * 1000UL;
 }
 
-bool saveFrameAsJpeg(camera_fb_t *fb, const char *path) {
-  if (!fb) return false;
-  if (fb->format == PIXFORMAT_JPEG) {
-    return sdWriteBytes(path, fb->buf, fb->len);
+void flipFrameRgb565(camera_fb_t *fb, bool flipH, bool flipV) {
+  if (!fb || fb->format != PIXFORMAT_RGB565 || !fb->buf || (!flipH && !flipV)) return;
+
+  const int w = fb->width;
+  const int h = fb->height;
+  uint16_t *pix = reinterpret_cast<uint16_t *>(fb->buf);
+
+  if (flipV) {
+    for (int y = 0; y < h / 2; ++y) {
+      uint16_t *rowTop = pix + (y * w);
+      uint16_t *rowBottom = pix + ((h - 1 - y) * w);
+      for (int x = 0; x < w; ++x) {
+        const uint16_t tmp = rowTop[x];
+        rowTop[x] = rowBottom[x];
+        rowBottom[x] = tmp;
+      }
+      if ((y % 8) == 0) delay(0);
+    }
   }
 
+  if (flipH) {
+    for (int y = 0; y < h; ++y) {
+      uint16_t *row = pix + (y * w);
+      for (int x = 0; x < w / 2; ++x) {
+        const int xr = w - 1 - x;
+        const uint16_t tmp = row[x];
+        row[x] = row[xr];
+        row[xr] = tmp;
+      }
+      if ((y % 8) == 0) delay(0);
+    }
+  }
+}
+
+static bool gTimeConfigured = false;
+static const char *kTimezoneRule = "CET-1CEST,M3.5.0/2,M10.5.0/3";
+
+void setupSystemTime() {
+  if (gTimeConfigured || WiFi.status() != WL_CONNECTED) return;
+
+  configTzTime(kTimezoneRule, "pool.ntp.org", "time.google.com", "time.nist.gov");
+
+  time_t now = 0;
+  const uint32_t start = millis();
+  while ((millis() - start) < 4000) {
+    time(&now);
+    if (now > 1700000000) {
+      gTimeConfigured = true;
+
+      struct tm tmNow;
+      localtime_r(&now, &tmNow);
+      char timeBuf[24];
+      snprintf(timeBuf, sizeof(timeBuf), "%04d-%02d-%02d %02d:%02d:%02d",
+        tmNow.tm_year + 1900,
+        tmNow.tm_mon + 1,
+        tmNow.tm_mday,
+        tmNow.tm_hour,
+        tmNow.tm_min,
+        tmNow.tm_sec);
+
+      logEvent("TIME", String("NTP synchronized, datetime=") + timeBuf + " epoch=" + String(static_cast<unsigned long>(now)));
+      return;
+    }
+    delay(50);
+  }
+  Serial.println("[TIME] NTP sync pending (using current clock value)");
+}
+
+bool storeFrameToMemory(camera_fb_t *fb) {
+  if (!fb) return false;
   uint8_t *jpgBuf = nullptr;
   size_t jpgLen = 0;
-  if (!frame2jpg(fb, 85, &jpgBuf, &jpgLen)) {
-    Serial.println("[CAM] frame2jpg failed");
-    return false;
+  bool owned = false;
+  if (fb->format == PIXFORMAT_JPEG) {
+    jpgBuf = static_cast<uint8_t *>(allocImageBuffer(fb->len));
+    if (!jpgBuf) return false;
+    memcpy(jpgBuf, fb->buf, fb->len);
+    jpgLen = fb->len;
+    owned = true;
+  } else {
+    if (!frame2jpg(fb, 85, &jpgBuf, &jpgLen)) {
+      Serial.println("[CAM] frame2jpg failed");
+      return false;
+    }
+    owned = true;
   }
 
-  const bool ok = sdWriteBytes(path, jpgBuf, jpgLen);
-  free(jpgBuf);
-  return ok;
+  if (gPhotoJpeg) free(gPhotoJpeg);
+  gPhotoJpeg = jpgBuf;
+  gPhotoJpegLen = jpgLen;
+  (void)owned;
+  return true;
 }
 
 uint8_t rgb565ToGray(uint16_t pixel) {
@@ -1193,7 +1433,6 @@ void setRegisterU16(uint16_t index, uint16_t value) {
 
 uint16_t currentFaultCode() {
   uint16_t faultCode = 0;
-  if (!gStorageReady) faultCode |= 0x01;
   if (!gCameraReady) faultCode |= 0x02;
   return faultCode;
 }
@@ -1206,12 +1445,12 @@ uint16_t currentAnalysisSourceCode() {
   switch (gAnalysisInputMode) {
     case AnalysisInputMode::Camera:
       return gCameraReady ? static_cast<uint16_t>(AnalysisSourceCode::CameraLive) : static_cast<uint16_t>(AnalysisSourceCode::Unavailable);
-    case AnalysisInputMode::SdPhoto:
-      return (gStorageReady && SD_MMC.exists(kPhotoPath)) ? static_cast<uint16_t>(AnalysisSourceCode::SdPhoto) : static_cast<uint16_t>(AnalysisSourceCode::Unavailable);
+    case AnalysisInputMode::MemPhoto:
+      return (gPhotoJpegLen > 0) ? static_cast<uint16_t>(AnalysisSourceCode::MemPhoto) : static_cast<uint16_t>(AnalysisSourceCode::Unavailable);
     case AnalysisInputMode::Auto:
     default:
       if (gCameraReady) return static_cast<uint16_t>(AnalysisSourceCode::CameraLive);
-      return (gStorageReady && SD_MMC.exists(kPhotoPath)) ? static_cast<uint16_t>(AnalysisSourceCode::SdPhoto) : static_cast<uint16_t>(AnalysisSourceCode::Unavailable);
+      return (gPhotoJpegLen > 0) ? static_cast<uint16_t>(AnalysisSourceCode::MemPhoto) : static_cast<uint16_t>(AnalysisSourceCode::Unavailable);
   }
 }
 
@@ -1219,8 +1458,8 @@ const char *currentAnalysisSourceName() {
   switch (static_cast<AnalysisSourceCode>(currentAnalysisSourceCode())) {
     case AnalysisSourceCode::CameraLive:
       return "camera_live";
-    case AnalysisSourceCode::SdPhoto:
-      return "sd_photo";
+    case AnalysisSourceCode::MemPhoto:
+      return "mem_photo";
     default:
       return "unavailable";
   }
@@ -1934,80 +2173,20 @@ String buildAnalysisJson(const DeviceConfig &config, const GaugeReading readings
   return json;
 }
 
-bool loadAnalysisFrameFromSd(AnalysisFrame &frame, String &error) {
-  if (!gStorageReady) {
-    error = "storage_not_ready";
-    return false;
-  }
-  if (!SD_MMC.exists(kPhotoPath)) {
+bool loadAnalysisFrameFromMemory(AnalysisFrame &frame, String &error) {
+  if (gPhotoJpegLen == 0 || !gPhotoJpeg) {
     error = "photo_not_found";
     return false;
   }
 
-  File f = SD_MMC.open(kPhotoPath, FILE_READ);
-  if (!f) {
-    error = "photo_open_failed";
-    return false;
-  }
-
-  const size_t jpgLen = f.size();
-  if (jpgLen == 0) {
-    f.close();
-    error = "photo_empty";
-    return false;
-  }
-
-  uint8_t *jpgBuf = static_cast<uint8_t *>(ps_malloc(jpgLen));
+  const size_t jpgLen = gPhotoJpegLen;
+  uint8_t *jpgBuf = static_cast<uint8_t *>(allocImageBuffer(jpgLen));
   if (!jpgBuf) {
-    f.close();
     error = "jpg_alloc_failed";
     return false;
   }
 
-  const size_t bytesRead = f.read(jpgBuf, jpgLen);
-  f.close();
-  if (bytesRead != jpgLen) {
-    free(jpgBuf);
-    error = "photo_read_failed";
-    return false;
-  }
-
-  auto parseJpegDimensions = [](const uint8_t *data, size_t len, uint16_t &width, uint16_t &height) -> bool {
-    if (!data || len < 4 || data[0] != 0xFF || data[1] != 0xD8) return false;
-
-    size_t offset = 2;
-    while (offset + 1 < len) {
-      while (offset < len && data[offset] == 0xFF) {
-        ++offset;
-      }
-      if (offset >= len) return false;
-
-      const uint8_t marker = data[offset++];
-      if (marker == 0xD9 || marker == 0xDA) return false;
-      if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
-      if (offset + 1 >= len) return false;
-
-      const uint16_t segmentLen = static_cast<uint16_t>((data[offset] << 8) | data[offset + 1]);
-      offset += 2;
-      if (segmentLen < 2 || offset + segmentLen - 2 > len) return false;
-
-      const bool isSofMarker =
-        (marker >= 0xC0 && marker <= 0xC3) ||
-        (marker >= 0xC5 && marker <= 0xC7) ||
-        (marker >= 0xC9 && marker <= 0xCB) ||
-        (marker >= 0xCD && marker <= 0xCF);
-      if (isSofMarker) {
-        if (segmentLen < 7) return false;
-        height = static_cast<uint16_t>((data[offset + 1] << 8) | data[offset + 2]);
-        width = static_cast<uint16_t>((data[offset + 3] << 8) | data[offset + 4]);
-        return width > 0 && height > 0;
-      }
-
-      offset += segmentLen - 2;
-    }
-
-    return false;
-  };
+  memcpy(jpgBuf, gPhotoJpeg, jpgLen);
 
   uint16_t imageWidth = 0;
   uint16_t imageHeight = 0;
@@ -2018,7 +2197,7 @@ bool loadAnalysisFrameFromSd(AnalysisFrame &frame, String &error) {
   }
 
   const size_t rgb565Len = static_cast<size_t>(imageWidth) * static_cast<size_t>(imageHeight) * 2;
-  uint8_t *rgbBuf = static_cast<uint8_t *>(ps_malloc(rgb565Len));
+  uint8_t *rgbBuf = static_cast<uint8_t *>(allocImageBuffer(rgb565Len));
   if (!rgbBuf) {
     free(jpgBuf);
     error = "rgb_alloc_failed";
@@ -2051,34 +2230,44 @@ bool loadAnalysisFrame(AnalysisFrame &frame, String &error) {
       error = "camera_not_ready";
       return false;
     }
-    frame.fb = captureFrameWithFlash();
-    if (!frame.fb) {
+    camera_fb_t *liveFb = captureFrameWithFlash();
+    if (!liveFb) {
       error = "capture_failed";
       return false;
     }
+    // OV3660 outputs JPEG natively; store to memory then decode to RGB565 for analysis
+    if (liveFb->format == PIXFORMAT_JPEG) {
+      const bool stored = storeFrameToMemory(liveFb);
+      esp_camera_fb_return(liveFb);
+      if (!stored) { error = "store_frame_failed"; return false; }
+      if (!loadAnalysisFrameFromMemory(frame, error)) return false;
+      gLastAnalysisSource = AnalysisSourceCode::CameraLive;
+      return true;
+    }
+    frame.fb = liveFb;
     gLastAnalysisSource = AnalysisSourceCode::CameraLive;
     return true;
   };
 
-  auto trySd = [&]() -> bool {
-    if (!loadAnalysisFrameFromSd(frame, error)) {
+  auto tryMem = [&]() -> bool {
+    if (!loadAnalysisFrameFromMemory(frame, error)) {
       return false;
     }
-    gLastAnalysisSource = AnalysisSourceCode::SdPhoto;
+    gLastAnalysisSource = AnalysisSourceCode::MemPhoto;
     return true;
   };
 
   switch (gAnalysisInputMode) {
     case AnalysisInputMode::Camera:
       return tryCamera();
-    case AnalysisInputMode::SdPhoto:
-      return trySd();
+    case AnalysisInputMode::MemPhoto:
+      return tryMem();
     case AnalysisInputMode::Auto:
     default:
       if (gCameraReady) {
         return tryCamera();
       }
-      return trySd();
+      return tryMem();
   }
 }
 
@@ -2092,18 +2281,13 @@ void releaseAnalysisFrame(AnalysisFrame &frame) {
   frame = AnalysisFrame();
 }
 
-bool captureAndSave() {
-  if (!gStorageReady) {
-    Serial.println("[SD] Storage not ready");
-    return false;
-  }
-
+bool captureToMemory() {
   if (!gCameraReady) {
-    if (SD_MMC.exists(kPhotoPath)) {
-      Serial.println("[SD] Camera unavailable, keeping existing photo");
+    if (gPhotoJpegLen > 0) {
+      Serial.println("[CAM] Camera unavailable, keeping existing photo in memory");
       return true;
     }
-    Serial.println("[CAM] Camera not ready and no fallback photo on SD");
+    Serial.println("[CAM] Camera not ready and no fallback photo in memory");
     return false;
   }
 
@@ -2113,15 +2297,15 @@ bool captureAndSave() {
     return false;
   }
 
-  const bool ok = saveFrameAsJpeg(fb, kPhotoPath);
+  const bool ok = storeFrameToMemory(fb);
   const size_t len = fb->len;
   esp_camera_fb_return(fb);
   if (!ok) {
-    Serial.println("[SD]  Photo write failed");
+    Serial.println("[CAM] Photo store to memory failed");
     return false;
   }
 
-  Serial.printf("[CAM] Photo saved (%u bytes)\n", len);
+  Serial.printf("[CAM] Photo in memory (%u bytes)\n", len);
   return true;
 }
 
@@ -2132,7 +2316,7 @@ void handleRoot() {
 
 void handleCapture() {
   if (!checkAuth()) return;
-  if (!captureAndSave()) {
+  if (!captureToMemory()) {
     server.send(gCameraReady ? 500 : 404, "text/plain", gCameraReady ? "capture_failed" : "photo_not_found");
     return;
   }
@@ -2141,10 +2325,6 @@ void handleCapture() {
 
 void handleAnalyze() {
   if (!checkAuth()) return;
-  if (!gStorageReady) {
-    server.send(503, "text/plain", "storage_not_ready");
-    return;
-  }
 
   DeviceConfig config;
   if (!loadDeviceConfig(config)) {
@@ -2157,11 +2337,15 @@ void handleAnalyze() {
   AnalysisFrame frame;
   String frameError;
   if (!loadAnalysisFrame(frame, frameError)) {
-    server.send(frameError == "storage_not_ready" ? 503 : 500, "text/plain", frameError);
+    server.send(500, "text/plain", frameError);
     return;
   }
 
   camera_fb_t *fb = frame.fb;
+
+  if (gFlipHorizontal || gFlipVertical) {
+    flipFrameRgb565(fb, gFlipHorizontal, gFlipVertical);
+  }
 
   if (fb->format != PIXFORMAT_RGB565) {
     releaseAnalysisFrame(frame);
@@ -2177,15 +2361,11 @@ void handleAnalyze() {
 
   const int frameWidth = fb->width;
   const int frameHeight = fb->height;
-  const bool sourceFromCamera = (frame.fb != &frame.ownedFb);
-  const bool photoOk = sourceFromCamera ? saveFrameAsJpeg(fb, kPhotoPath) : true;
+  if (!storeFrameToMemory(fb)) {
+    logEvent("CAM", "failed to store analyzed frame to memory");
+  }
   const String response = buildAnalysisJson(config, readings, frameWidth, frameHeight, millis() - start);
   releaseAnalysisFrame(frame);
-
-  if (!photoOk) {
-    server.send(500, "text/plain", "photo_save_failed");
-    return;
-  }
 
   Serial.printf("[CV] Analysis done in %u ms  source=%s  mode=%s  frame=%dx%d\n",
     static_cast<unsigned>(millis() - start), currentAnalysisSourceName(), analysisInputModeName(gAnalysisInputMode), frameWidth, frameHeight);
@@ -2204,58 +2384,35 @@ void handleAnalyze() {
 
 void handlePhoto() {
   if (!checkAuth()) return;
-  if (!gStorageReady) {
-    server.send(503, "text/plain", "storage_not_ready");
-    return;
-  }
-  if (!SD_MMC.exists(kPhotoPath)) {
+  if (gPhotoJpegLen == 0 || !gPhotoJpeg) {
     server.send(404, "text/plain", "photo_not_found");
     return;
   }
-  File f = SD_MMC.open(kPhotoPath, FILE_READ);
-  if (!f) {
-    server.send(500, "text/plain", "open_failed");
-    return;
-  }
-  server.streamFile(f, "image/jpeg");
-  f.close();
+  server.send_P(200, "image/jpeg", reinterpret_cast<const char *>(gPhotoJpeg), gPhotoJpegLen);
 }
 
 void handleGetConfig() {
   if (!checkAuth()) return;
-  if (!gStorageReady) {
-    server.send(503, "text/plain", "storage_not_ready");
-    return;
-  }
-  if (!SD_MMC.exists(kConfigPath)) {
+  if (!gPrefs.isKey("cfg")) {
     server.send(404, "text/plain", "config_not_found");
     return;
   }
-  File f = SD_MMC.open(kConfigPath, FILE_READ);
-  if (!f) {
-    server.send(500, "text/plain", "open_failed");
+  const String json = gPrefs.getString("cfg", "");
+  if (json.isEmpty()) {
+    server.send(404, "text/plain", "config_not_found");
     return;
   }
-  server.streamFile(f, "application/json");
-  f.close();
+  server.send(200, "application/json", json);
 }
 
 void handleSaveConfig() {
   if (!checkAuth()) return;
-  if (!gStorageReady) {
-    server.send(503, "text/plain", "storage_not_ready");
-    return;
-  }
   const String body = server.arg("plain");
   if (body.length() == 0) {
     server.send(400, "text/plain", "empty_body");
     return;
   }
-  if (!sdEnsureDir("/config")) {
-    server.send(500, "text/plain", "mkdir_failed");
-    return;
-  }
-  if (!sdWriteText(kConfigPath, body)) {
+  if (!gPrefs.putString("cfg", body)) {
     server.send(500, "text/plain", "write_failed");
     return;
   }
@@ -2263,72 +2420,56 @@ void handleSaveConfig() {
   if (loadDeviceConfig(config)) {
     applyRuntimeSettings(config);
   }
-  logEvent("CFG", "config.json saved");
+  logEvent("CFG", "config saved to NVS");
   server.send(200, "text/plain", "ok");
 }
 
 void handleGetLogs() {
   if (!checkAuth()) return;
-  if (!gStorageReady) {
-    server.send(503, "text/plain", "storage_not_ready");
-    return;
-  }
-
-  if (!SD_MMC.exists(kLogPath)) {
-    server.send(200, "text/plain; charset=utf-8", "Brak wpisow logu\n");
-    return;
-  }
-
-  const String logTail = sdReadTextTail(kLogPath, kWebLogTailBytes);
-  server.send(200, "text/plain; charset=utf-8", logTail.length() ? logTail : String("Brak wpisow logu\n"));
+  server.send(200, "text/plain; charset=utf-8", gLogBuffer.length() ? gLogBuffer : String("No log entries\n"));
 }
 
 void handleClearLogs() {
   if (!checkAuth()) return;
-  if (!gStorageReady) {
-    server.send(503, "text/plain", "storage_not_ready");
-    return;
-  }
-
-  if (SD_MMC.exists(kLogPath) && !SD_MMC.remove(kLogPath)) {
-    server.send(500, "text/plain", "clear_failed");
-    return;
-  }
-
+  gLogBuffer = "";
   logEvent("LOG", "Log cleared from web UI");
   server.send(200, "text/plain", "ok");
 }
 
 void handleUploadBody() {
   HTTPUpload &upload = server.upload();
-  if (!gStorageReady) return;
   if (upload.status == UPLOAD_FILE_START) {
-    if (SD_MMC.exists(kPhotoPath)) SD_MMC.remove(kPhotoPath);
-    gUploadFile = SD_MMC.open(kPhotoPath, FILE_WRITE);
-    if (!gUploadFile) Serial.println("[UPLOAD] Cannot open file for write");
+    if (gUploadBuf) { free(gUploadBuf); gUploadBuf = nullptr; gUploadLen = 0; }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (gUploadFile) gUploadFile.write(upload.buf, upload.currentSize);
+    uint8_t *newBuf = static_cast<uint8_t *>(reallocImageBuffer(gUploadBuf, gUploadLen + upload.currentSize));
+    if (newBuf) {
+      memcpy(newBuf + gUploadLen, upload.buf, upload.currentSize);
+      gUploadBuf = newBuf;
+      gUploadLen += upload.currentSize;
+    } else {
+      Serial.println("[UPLOAD] buffer realloc failed");
+    }
   } else if (upload.status == UPLOAD_FILE_END) {
-    if (gUploadFile) gUploadFile.close();
+    if (gPhotoJpeg) free(gPhotoJpeg);
+    gPhotoJpeg = gUploadBuf;
+    gPhotoJpegLen = gUploadLen;
+    gUploadBuf = nullptr;
+    gUploadLen = 0;
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    if (gUploadFile) { gUploadFile.close(); SD_MMC.remove(kPhotoPath); }
+    if (gUploadBuf) { free(gUploadBuf); gUploadBuf = nullptr; gUploadLen = 0; }
   }
 }
 
 void handleUploadDone() {
   if (!checkAuth()) {
-    if (gStorageReady) SD_MMC.remove(kPhotoPath);
+    if (gPhotoJpegLen == 0) { if (gUploadBuf) { free(gUploadBuf); gUploadBuf = nullptr; gUploadLen = 0; } }
     return;
   }
-  if (!gStorageReady) {
-    server.send(503, "text/plain", "storage_not_ready");
-    return;
-  }
-  if (!SD_MMC.exists(kPhotoPath)) {
+  if (gPhotoJpegLen == 0) {
     server.send(500, "text/plain", "upload_failed");
     return;
   }
-  logEvent("UPLOAD", String("JPEG uploaded -> ") + kPhotoPath);
+  logEvent("UPLOAD", "JPEG uploaded to memory");
   server.send(200, "text/plain", "ok");
 }
 
@@ -2346,7 +2487,6 @@ String buildModbusStatusJson() {
   json += "\"analysis_input_mode\":\"" + String(analysisInputModeName(gAnalysisInputMode)) + "\",";
   json += "\"analysis_source\":\"" + String(currentAnalysisSourceName()) + "\",";
   json += "\"camera_ready\":" + String(gCameraReady ? "true" : "false") + ',';
-  json += "\"storage_ready\":" + String(gStorageReady ? "true" : "false") + ',';
   json += "\"registers\":[";
   for (uint16_t i = 0; i < kModbusRegCount; ++i) {
     if (i > 0) json += ',';
@@ -2520,6 +2660,7 @@ void setEmergencyFault(EmergencyFault fault) {
 }
 
 void writeFlashLedRaw(bool enabled) {
+  if (FLASH_LED_GPIO_NUM < 0) return;
   digitalWrite(FLASH_LED_GPIO_NUM, enabled ? HIGH : LOW);
 }
 
@@ -2532,6 +2673,11 @@ void setFlashLed(bool enabled) {
 }
 
 void setupFlashLed() {
+  if (FLASH_LED_GPIO_NUM < 0) {
+    gFlashEnabled = false;
+    Serial.println("[FLASH] No flash LED GPIO configured");
+    return;
+  }
   pinMode(FLASH_LED_GPIO_NUM, OUTPUT);
   setFlashLed(false);
   Serial.println("[FLASH] LED ready");
@@ -2612,6 +2758,22 @@ camera_fb_t *captureFrameWithFlash() {
 }
 
 bool setupCamera() {
+  // Brief delay so Serial monitor can attach and catch early diagnostics
+  delay(200);
+  Serial.println("[CAM] ===== Camera diagnostics =====");
+  Serial.printf("[CAM] Pins: XCLK=%d SIOD=%d SIOC=%d\n", XCLK_GPIO_NUM, SIOD_GPIO_NUM, SIOC_GPIO_NUM);
+  Serial.printf("[CAM] Pins: D0-D7=%d,%d,%d,%d,%d,%d,%d,%d\n",
+    Y2_GPIO_NUM, Y3_GPIO_NUM, Y4_GPIO_NUM, Y5_GPIO_NUM,
+    Y6_GPIO_NUM, Y7_GPIO_NUM, Y8_GPIO_NUM, Y9_GPIO_NUM);
+  Serial.printf("[CAM] Pins: VSYNC=%d HREF=%d PCLK=%d PWDN=%d RST=%d\n",
+    VSYNC_GPIO_NUM, HREF_GPIO_NUM, PCLK_GPIO_NUM, PWDN_GPIO_NUM, RESET_GPIO_NUM);
+
+  const size_t psFree = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  const size_t psTotal = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+  const size_t intFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  Serial.printf("[CAM] PSRAM free=%u total=%u  internal free=%u\n",
+    static_cast<unsigned>(psFree), static_cast<unsigned>(psTotal), static_cast<unsigned>(intFree));
+
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -2632,44 +2794,75 @@ bool setupCamera() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_RGB565;
-
-  // Fixed stable resolution requested by user: 1024x768.
-  config.frame_size = FRAMESIZE_XGA;
-  config.jpeg_quality = 16;
+  // OV3660 is a JPEG-only sensor; RGB565 causes ESP_FAIL during init
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.jpeg_quality = 15;
   config.fb_count = 1;
+  const bool psramAvailable = (psTotal >= (512U * 1024U));
+  config.fb_location = psramAvailable ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  Serial.printf("[CAM] Using %s frame buffer\n", psramAvailable ? "PSRAM" : "DRAM");
 
-  const esp_err_t camErr = esp_camera_init(&config);
+  // Try from highest to lowest resolution to validate maximum stable quality.
+  const framesize_t kSizeCandidatesPsram[] = {
+    FRAMESIZE_QXGA,   // 2048x1536 (3MP, OV3660 max)
+    FRAMESIZE_P_3MP,  // 864x1536
+    FRAMESIZE_UXGA,   // 1600x1200
+    FRAMESIZE_SXGA,   // 1280x1024
+    FRAMESIZE_XGA,    // 1024x768
+    FRAMESIZE_SVGA,   // 800x600
+    FRAMESIZE_VGA,    // 640x480
+    FRAMESIZE_HVGA,   // 480x320
+    FRAMESIZE_CIF,    // 400x296
+    FRAMESIZE_QVGA,   // 320x240
+    FRAMESIZE_240X240,
+    FRAMESIZE_HQVGA,  // 240x176
+    FRAMESIZE_QCIF,   // 176x144
+    FRAMESIZE_QQVGA,  // 160x120
+    FRAMESIZE_96X96,
+  };
+  const framesize_t kSizeCandidatesDram[] = {
+    FRAMESIZE_HVGA,
+    FRAMESIZE_QVGA,
+    FRAMESIZE_QQVGA,
+  };
+
+  const framesize_t *kSizeCandidates = psramAvailable ? kSizeCandidatesPsram : kSizeCandidatesDram;
+  const size_t kSizeCandidatesCount = psramAvailable
+    ? (sizeof(kSizeCandidatesPsram) / sizeof(kSizeCandidatesPsram[0]))
+    : (sizeof(kSizeCandidatesDram) / sizeof(kSizeCandidatesDram[0]));
+
+  esp_err_t camErr = ESP_FAIL;
+  for (size_t i = 0; i < kSizeCandidatesCount; ++i) {
+    const framesize_t sz = kSizeCandidates[i];
+    config.frame_size = sz;
+    camErr = esp_camera_init(&config);
+    if (camErr == ESP_OK) {
+      Serial.printf("[CAM] Init OK with frame_size=%d\n", static_cast<int>(sz));
+      break;
+    }
+    Serial.printf("[CAM] frame_size=%d failed: 0x%x (%s), trying smaller...\n",
+      static_cast<int>(sz), static_cast<unsigned>(camErr), esp_err_to_name(camErr));
+    esp_camera_deinit();
+    delay(50); // allow sensor to settle before next init attempt
+  }
 
   if (camErr != ESP_OK) {
-    Serial.printf("[CAM] Camera init failed (0x%x)\n", static_cast<unsigned>(camErr));
+    Serial.printf("[CAM] Camera init failed on all frame sizes. Last error: 0x%x (%s)\n",
+      static_cast<unsigned>(camErr), esp_err_to_name(camErr));
     return false;
   }
 
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
+    Serial.printf("[CAM] Sensor detected: id=0x%02x\n", s->id.PID);
     s->set_brightness(s, 1);
     s->set_contrast(s, 1);
     s->set_saturation(s, 0);
+  } else {
+    Serial.println("[CAM] WARNING: esp_camera_sensor_get() returned null");
   }
 
   Serial.println("[CAM] Camera ready");
-  return true;
-}
-
-bool setupStorage() {
-  if (!SD_MMC.begin("/sdcard", true)) {
-    Serial.println("[SD] SD_MMC mount failed");
-    return false;
-  }
-
-  const uint8_t cardType = SD_MMC.cardType();
-  if (cardType == CARD_NONE) {
-    Serial.println("[SD] No SD card detected");
-    return false;
-  }
-
-  Serial.println("[SD] Storage ready");
   return true;
 }
 
@@ -2690,6 +2883,7 @@ void setupWiFi() {
     Serial.print("[WiFi] Connected. IP: ");
     Serial.println(WiFi.localIP());
     Serial.printf("[WiFi] RSSI: %d dBm\n", WiFi.RSSI());
+    setupSystemTime();
   } else {
     Serial.println("[WiFi] Connection timeout");
   }
@@ -2699,7 +2893,10 @@ static const uint32_t kWiFiReconnectIntervalMs = 15000;
 static uint32_t lastWiFiReconnectMs = 0;
 
 void maintainWiFi(uint32_t nowMs) {
-  if (WiFi.status() == WL_CONNECTED) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    setupSystemTime();
+    return;
+  }
   if (nowMs - lastWiFiReconnectMs < kWiFiReconnectIntervalMs) return;
 
   lastWiFiReconnectMs = nowMs;
@@ -2728,36 +2925,32 @@ void setup() {
   Serial.begin(115200);
   delay(1500);
   Serial.println();
-  Serial.println("[BOOT] ESP32-CAM Manometry v0.3");
+  Serial.println("[BOOT] ESP32-S3 OV3660 Manometer v0.3");
+
+  // Chip info
+  esp_chip_info_t chip;
+  esp_chip_info(&chip);
+  Serial.printf("[BOOT] Chip: cores=%d rev=%d features=0x%x\n",
+    chip.cores, chip.revision, static_cast<unsigned>(chip.features));
+  Serial.printf("[BOOT] Heap free: internal=%u PSRAM=%u\n",
+    static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+    static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
 
   setupFlashLed();
 
-  gStorageReady = setupStorage();
-  if (!gStorageReady) {
-    logEvent("BOOT", "Warning: storage setup failed -> safe mode path active");
-  } else {
-    logEvent("BOOT", "Storage setup OK");
-  }
+  gPrefs.begin("manometr", false);
+  logEvent("BOOT", String("NVS preferences ready, cfg stored: ") + (gPrefs.isKey("cfg") ? "yes" : "no"));
 
   gCameraReady = setupCamera();
   if (!gCameraReady) {
-    logEvent("BOOT", "Warning: camera setup failed -> safe mode path active");
+    logEvent("BOOT", "Camera setup FAILED - check wiring and pin map");
   } else {
     logEvent("BOOT", "Camera setup OK");
   }
 
-  if (!gStorageReady) {
-    setEmergencyFault(
-      (!gStorageReady && !gCameraReady)
-        ? EmergencyFault::StorageAndCamera
-        : (!gStorageReady ? EmergencyFault::Storage : EmergencyFault::Camera)
-    );
-    setEmergencyMode(
-      true,
-      (!gStorageReady && !gCameraReady)
-        ? "storage+camera init failed"
-        : (!gStorageReady ? "storage init failed" : "camera init failed")
-    );
+  if (!gCameraReady) {
+    setEmergencyFault(EmergencyFault::Camera);
+    setEmergencyMode(true, "camera init failed");
   }
 
   setupWiFi();
@@ -2773,18 +2966,13 @@ void setup() {
     logEvent("CFG", "No config found, using defaults (analysis_input_source=auto)");
   }
 
-  if (!captureAndSave()) {
-    logEvent("BOOT", "Initial capture/fallback photo check failed (continuing)");
+  if (!captureToMemory()) {
+    logEvent("BOOT", "Initial capture failed (continuing)");
   }
   logEvent("BOOT", "Setup completed");
 }
 
 static void runPeriodicAnalysis() {
-  if (!gStorageReady) {
-    Serial.println("[CV] Periodic: storage not ready, skipping");
-    return;
-  }
-
   DeviceConfig config;
   if (!loadDeviceConfig(config)) {
     Serial.println("[CV] Periodic: calibration missing, skipping");
@@ -2801,6 +2989,10 @@ static void runPeriodicAnalysis() {
 
   camera_fb_t *fb = frame.fb;
 
+  if (gFlipHorizontal || gFlipVertical) {
+    flipFrameRgb565(fb, gFlipHorizontal, gFlipVertical);
+  }
+
   if (fb->format != PIXFORMAT_RGB565) {
     releaseAnalysisFrame(frame);
     Serial.println("[CV] Periodic: unexpected pixel format");
@@ -2816,8 +3008,8 @@ static void runPeriodicAnalysis() {
 
   const int frameWidth = fb->width;
   const int frameHeight = fb->height;
-  if (frame.fb != &frame.ownedFb) {
-    saveFrameAsJpeg(fb, kPhotoPath);
+  if (!storeFrameToMemory(fb)) {
+    logEvent("CAM", "periodic: failed to store analyzed frame to memory");
   }
   const uint32_t elapsed = millis() - start;
   releaseAnalysisFrame(frame);
